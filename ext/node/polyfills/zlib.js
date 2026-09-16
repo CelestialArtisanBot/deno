@@ -1,5 +1,5 @@
 // deno-lint-ignore-file
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -22,12 +22,14 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+(function () {
 "use strict";
 
-import { primordials } from "ext:core/mod.js";
+const { core, primordials } = __bootstrap;
 const {
   ArrayBuffer,
   MathMax,
+  NumberIsInteger,
   NumberIsNaN,
   ObjectDefineProperties,
   ObjectDefineProperty,
@@ -37,13 +39,14 @@ const {
   ObjectSetPrototypeOf,
   ReflectApply,
   Symbol,
+  TypedArrayPrototypeGetByteLength,
   Uint32Array,
 } = primordials;
 
-import {
-  codes as errorCodes,
+const {
+  codes: errorCodes,
   genericNodeError,
-} from "ext:deno_node/internal/errors.ts";
+} = core.loadExtScript("ext:deno_node/internal/errors.ts");
 
 const {
   ERR_BROTLI_INVALID_PARAM,
@@ -51,32 +54,49 @@ const {
   ERR_INVALID_ARG_TYPE,
   ERR_OUT_OF_RANGE,
   ERR_TRAILING_JUNK_AFTER_STREAM_END,
+  ERR_ZLIB_INITIALIZATION_FAILED,
   ERR_ZSTD_INVALID_PARAM,
 } = errorCodes;
 
-import { finished, Transform } from "node:stream";
-import { deprecateInstantiation } from "ext:deno_node/internal/util.mjs";
-import {
+const { finished, Transform } = core.createLazyLoader("node:stream")();
+const { deprecateInstantiation } = core.loadExtScript(
+  "ext:deno_node/internal/util.mjs",
+);
+const {
   isAnyArrayBuffer,
   isArrayBufferView,
   isUint8Array,
-} from "ext:deno_node/internal/util/types.ts";
-import * as binding from "ext:deno_node/_zlib_binding.mjs";
+} = core.loadExtScript("ext:deno_node/internal/util/types.ts");
+const binding = core.loadExtScript("ext:deno_node/_zlib_binding.mjs");
 const { crc32: crc32Native } = binding;
 
-import assert from "ext:deno_node/internal/assert.mjs";
-import { Buffer, kMaxLength } from "node:buffer";
-import { ownerSymbol as owner_symbol } from "ext:deno_node/internal_binding/symbols.ts";
-import {
+const assert = core.loadExtScript(
+  "ext:deno_node/internal/assert.mjs",
+);
+const { Buffer, kMaxLength } = core.loadExtScript(
+  "ext:deno_node/internal/buffer.mjs",
+);
+const { ownerSymbol: owner_symbol } = core.loadExtScript(
+  "ext:deno_node/internal_binding/symbols.ts",
+);
+const {
   checkRangesOrGetDefault,
+  validateBoolean,
   validateFiniteNumber,
   validateFunction,
   validateUint32,
-} from "ext:deno_node/internal/validators.mjs";
-import { zlib as zlibConstants } from "ext:deno_node/internal_binding/constants.ts";
+} = core.loadExtScript("ext:deno_node/internal/validators.mjs");
+const { zlib: zlibConstants } = core.loadExtScript(
+  "ext:deno_node/internal_binding/constants.ts",
+);
 
 const kFlushFlag = Symbol("kFlushFlag");
 const kError = Symbol("kError");
+// Hold the unwrapped native write/writeSync methods so our own call sites can
+// invoke them directly, bypassing the arity-compat wrapper (see
+// `setupHandleWriteState`).
+const kNativeWrite = Symbol("kNativeWrite");
+const kNativeWriteSync = Symbol("kNativeWriteSync");
 
 const {
   // Zlib flush levels
@@ -123,12 +143,12 @@ const {
   ZSTD_e_end,
 } = zlibConstants;
 
-export const constants = zlibConstants;
+const constants = ObjectFreeze(zlibConstants);
 
 // Translation table for return codes.
-export const codes = {
+const codes = {
   Z_OK: constants.Z_OK,
-  Z_STREAM_END: constants.Z_STREAM_EBROTLI_COMPRESSND,
+  Z_STREAM_END: constants.Z_STREAM_END,
   Z_NEED_DICT: constants.Z_NEED_DICT,
   Z_ERRNO: constants.Z_ERRNO,
   Z_STREAM_ERROR: constants.Z_STREAM_ERROR,
@@ -141,6 +161,8 @@ export const codes = {
 for (const ckey of ObjectKeys(codes)) {
   codes[codes[ckey]] = ckey;
 }
+
+ObjectFreeze(codes);
 
 function zlibBuffer(engine, buffer, callback) {
   validateFunction(callback, "callback");
@@ -225,8 +247,16 @@ function zlibOnError(message, errno, code) {
   const error = genericNodeError(message, { errno, code });
   error.errno = errno;
   error.code = code;
-  self.destroy(error);
+  // Set the error synchronously so sync operations can check it immediately
   self[kError] = error;
+
+  // Defer destroy to allow error listeners to be attached.
+  // In Node.js, zlib operations run on the libuv threadpool and callbacks
+  // are invoked asynchronously. Deno's implementation is synchronous, so
+  // we need to explicitly defer to match Node.js behavior.
+  process.nextTick(() => {
+    self.destroy(error);
+  });
 }
 
 const FLUSH_BOUND = [
@@ -291,6 +321,13 @@ function ZlibBase(opts, mode, handle, { flush, finishFlush, fullFlush }) {
       kMaxLength,
       kMaxLength,
     );
+
+    if (opts.rejectGarbageAfterEnd !== undefined) {
+      validateBoolean(
+        opts.rejectGarbageAfterEnd,
+        "options.rejectGarbageAfterEnd",
+      );
+    }
 
     if (opts.encoding || opts.objectMode || opts.writableObjectMode) {
       opts = { ...opts };
@@ -444,7 +481,40 @@ ZlibBase.prototype._processChunk = function (chunk, flushFlag, cb) {
   }
 };
 
+// `byteLength` can be shadowed by an own accessor, and the write paths below
+// trust the value they are handed to size the read out of the backing store.
+// Check the reported size against the intrinsic one before it is used as a
+// length, and likewise that the output window is inside the output buffer.
+// The ops bounds-check as well, so this is about reporting Node's error rather
+// than about memory safety.
+function validateChunkBounds(self, chunk) {
+  if (isUint8Array(chunk)) {
+    const actual = TypedArrayPrototypeGetByteLength(chunk);
+    if (chunk.byteLength > actual) {
+      throw new ERR_OUT_OF_RANGE(
+        "chunk.byteLength",
+        `<= ${actual}`,
+        chunk.byteLength,
+      );
+    }
+  }
+  // A fractional offset would otherwise be truncated on the way into the op,
+  // so reject it here instead of silently writing somewhere else.
+  if (
+    !NumberIsInteger(self._outOffset) ||
+    self._outOffset < 0 ||
+    self._outOffset > self._chunkSize
+  ) {
+    throw new ERR_OUT_OF_RANGE(
+      "outOffset",
+      `an integer >= 0 and <= ${self._chunkSize}`,
+      self._outOffset,
+    );
+  }
+}
+
 function processChunkSync(self, chunk, flushFlag) {
+  validateChunkBounds(self, chunk);
   let availInBefore = chunk.byteLength;
   let availOutBefore = self._chunkSize - self._outOffset;
   let inOff = 0;
@@ -465,20 +535,22 @@ function processChunkSync(self, chunk, flushFlag) {
     error = er;
   });
 
-  if (chunk instanceof DataView) {
+  // The native binding expects a Uint8Array
+  if (!isUint8Array(chunk)) {
     chunk = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
   }
 
   while (true) {
-    handle.writeSync(
+    handle[kNativeWriteSync](
       flushFlag,
       chunk, // in
       inOff, // in_off
       availInBefore, // in_len
       buffer, // out
       offset, // out_off
-      availOutBefore,
-    ); // out_len
+      availOutBefore, // out_len
+      state,
+    );
     if (error) {
       throw error;
     } else if (self[kError]) {
@@ -525,7 +597,15 @@ function processChunkSync(self, chunk, flushFlag) {
     }
   }
 
+  // Recorded before the trailing-junk check so the count of what was actually
+  // consumed is observable on the throwing path too.
   self.bytesWritten = inputRead;
+
+  if (availInAfter > 0 && self._rejectGarbageAfterEnd) {
+    _close(self);
+    throw new ERR_TRAILING_JUNK_AFTER_STREAM_END();
+  }
+
   _close(self);
 
   if (nread === 0) {
@@ -539,6 +619,13 @@ function processChunk(self, chunk, flushFlag, cb) {
   const handle = self._handle;
   if (!handle) return process.nextTick(cb);
 
+  validateChunkBounds(self, chunk);
+
+  // The native binding expects a Uint8Array
+  if (!isUint8Array(chunk)) {
+    chunk = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  }
+
   handle.buffer = chunk;
   handle.cb = cb;
   handle.availOutBefore = self._chunkSize - self._outOffset;
@@ -546,15 +633,35 @@ function processChunk(self, chunk, flushFlag, cb) {
   handle.inOff = 0;
   handle.flushFlag = flushFlag;
 
-  handle.write(
-    flushFlag,
-    chunk, // in
-    0, // in_off
-    handle.availInBefore, // in_len
-    self._outBuffer, // out
-    self._outOffset, // out_off
-    handle.availOutBefore,
-  ); // out_len
+  handle._callbackPending = true;
+
+  try {
+    handle[kNativeWrite](
+      flushFlag,
+      chunk, // in
+      0, // in_off
+      handle.availInBefore, // in_len
+      self._outBuffer, // out
+      self._outOffset, // out_off
+      handle.availOutBefore, // out_len
+      self._writeState,
+    );
+  } catch (err) {
+    // Set appropriate error code for zstd errors
+    if (err.message && err.message.includes("Src size is incorrect")) {
+      err.code = "ZSTD_error_srcSize_wrong";
+    }
+    self.destroy(err);
+    return;
+  }
+
+  // If the native binding did not call processCallback synchronously
+  // (Zlib defers it to match Node.js where compression runs on the libuv
+  // threadpool), schedule it asynchronously. Always schedule even on error
+  // so processCallback can call cb() to unblock the Transform write chain.
+  if (handle._callbackPending) {
+    process.nextTick(processCallback.bind(handle));
+  }
 }
 
 function processCallback() {
@@ -562,10 +669,20 @@ function processCallback() {
   // important to null out the values once they are no longer needed since
   // `_handle` can stay in memory long after the buffer is needed.
   const handle = this;
+  handle._callbackPending = false;
   const self = this[owner_symbol];
   const state = self._writeState;
 
   if (self.destroyed) {
+    this.buffer = null;
+    this.cb();
+    return;
+  }
+
+  if (self[kError]) {
+    // An error occurred during the native write. Call cb() to unblock the
+    // Transform write chain; the error event will be emitted by the nextTick
+    // destroy scheduled in zlibOnError.
     this.buffer = null;
     this.cb();
     return;
@@ -608,28 +725,52 @@ function processCallback() {
     handle.availInBefore = availInAfter;
 
     if (!streamBufferIsFull) {
-      this.write(
-        handle.flushFlag,
-        this.buffer, // in
-        handle.inOff, // in_off
-        handle.availInBefore, // in_len
-        self._outBuffer, // out
-        self._outOffset, // out_off
-        self._chunkSize,
-      ); // out_len
-    } else {
-      const oldRead = self._read;
-      self._read = (n) => {
-        self._read = oldRead;
-        this.write(
+      process.nextTick(() => {
+        if (self.destroyed) {
+          this.buffer = null;
+          this.cb();
+          return;
+        }
+        handle._callbackPending = true;
+        this[kNativeWrite](
           handle.flushFlag,
           this.buffer, // in
           handle.inOff, // in_off
           handle.availInBefore, // in_len
           self._outBuffer, // out
           self._outOffset, // out_off
-          self._chunkSize,
-        ); // out_len
+          self._chunkSize, // out_len
+          self._writeState,
+        );
+        if (handle._callbackPending) {
+          processCallback.call(this);
+        }
+      });
+    } else {
+      const oldRead = self._read;
+      self._read = (n) => {
+        self._read = oldRead;
+        process.nextTick(() => {
+          if (self.destroyed) {
+            this.buffer = null;
+            this.cb();
+            return;
+          }
+          handle._callbackPending = true;
+          this[kNativeWrite](
+            handle.flushFlag,
+            this.buffer, // in
+            handle.inOff, // in_off
+            handle.availInBefore, // in_len
+            self._outBuffer, // out
+            self._outOffset, // out_off
+            self._chunkSize, // out_len
+            self._writeState,
+          );
+          if (handle._callbackPending && !self[kError]) {
+            processCallback.call(this);
+          }
+        });
         self._read(n);
       };
     }
@@ -667,6 +808,48 @@ function _close(engine) {
   // Caller may invoke .close after a zlib error (which will null _handle)
   engine._handle?.close();
   engine._handle = null;
+}
+
+// The native write/writeSync ops take the write-state buffer (where the
+// post-write avail_out/avail_in values are stored) as a per-write argument
+// rather than caching a pointer to it, so that detaching the buffer is a
+// harmless no-op instead of a dangling write. Our own call sites always pass
+// it, but some npm packages (e.g. pngjs's sync inflate) call the low-level
+// `_handle.write()` / `_handle.writeSync()` directly using Node's binding
+// signature, which omits that trailing argument. Wrap the handle so those
+// external callers transparently get the stream's `_writeState` injected.
+//
+// Our own call sites always pass the buffer, so they invoke the stashed native
+// methods (`handle[kNativeWrite]` / `handle[kNativeWriteSync]`) directly to skip
+// the wrapper's per-write frame and argument array on every chunk.
+function setupHandleWriteState(handle, writeState) {
+  const nativeWrite = handle.write;
+  const nativeWriteSync = handle.writeSync;
+  handle[kNativeWrite] = nativeWrite;
+  handle[kNativeWriteSync] = nativeWriteSync;
+  const wrap = (native) =>
+    function (flush, input, inOff, inLen, out, outOff, outLen, state) {
+      return ReflectApply(native, this, [
+        flush,
+        input,
+        inOff,
+        inLen,
+        out,
+        outOff,
+        outLen,
+        state === undefined ? writeState : state,
+      ]);
+    };
+  ObjectDefineProperty(handle, "write", {
+    value: wrap(nativeWrite),
+    writable: true,
+    configurable: true,
+  });
+  ObjectDefineProperty(handle, "writeSync", {
+    value: wrap(nativeWriteSync),
+    writable: true,
+    configurable: true,
+  });
 }
 
 const zlibDefaultOpts = {
@@ -742,6 +925,14 @@ function Zlib(opts, mode) {
         );
       }
     }
+    // The native binding expects a Uint8Array, convert other ArrayBufferViews
+    if (dictionary !== undefined && !isUint8Array(dictionary)) {
+      dictionary = new Uint8Array(
+        dictionary.buffer,
+        dictionary.byteOffset,
+        dictionary.byteLength,
+      );
+    }
   }
 
   const handle = new binding.Zlib(mode);
@@ -749,17 +940,23 @@ function Zlib(opts, mode) {
   // to come up with a good solution that doesn't break our internal API,
   // and with it all supported npm versions at the time of writing.
   this._writeState = new Uint32Array(2);
+  setupHandleWriteState(handle, this._writeState);
   handle.init(
     windowBits,
     level,
     memLevel,
     strategy,
-    this._writeState,
     processCallback,
     dictionary,
   );
 
   ReflectApply(ZlibBase, this, [opts, mode, handle, zlibDefaultOpts]);
+
+  if (this._rejectGarbageAfterEnd) {
+    // Stop the engine from transparently continuing into the next gzip member,
+    // so trailing input is still visible as unconsumed after the write.
+    handle.setRejectGarbageAfterEnd(true);
+  }
 
   this._level = level;
   this._strategy = strategy;
@@ -921,7 +1118,14 @@ function Brotli(opts, mode) {
     : new binding.BrotliEncoder(mode);
 
   this._writeState = new Uint32Array(2);
-  handle.init(brotliInitParamsArray, this._writeState, processCallback);
+  setupHandleWriteState(handle, this._writeState);
+  const success = handle.init(
+    brotliInitParamsArray,
+    processCallback,
+  );
+  if (!success) {
+    throw new ERR_ZLIB_INITIALIZATION_FAILED("Initialization failed");
+  }
 
   ReflectApply(ZlibBase, this, [opts, mode, handle, brotliDefaultOpts]);
 }
@@ -979,18 +1183,24 @@ class Zstd extends ZlibBase {
     }
 
     const handle = mode === ZSTD_COMPRESS
-      ? new binding.ZstdCompress()
-      : new binding.ZstdDecompress();
-
-    const pledgedSrcSize = opts?.pledgedSrcSize ?? undefined;
+      ? new binding.ZstdCompress(mode)
+      : new binding.ZstdDecompress(mode);
 
     const writeState = new Uint32Array(2);
-    handle.init(
+    setupHandleWriteState(handle, writeState);
+    // pledgedSrcSize is only used for compression, use -1 to indicate "not set"
+    const pledgedSrcSize =
+      mode === ZSTD_COMPRESS && opts?.pledgedSrcSize != null
+        ? opts.pledgedSrcSize
+        : -1;
+    const success = handle.init(
       initParamsArray,
-      pledgedSrcSize,
-      writeState,
       processCallback,
+      pledgedSrcSize,
     );
+    if (!success) {
+      throw new ERR_ZLIB_INITIALIZATION_FAILED("Setting parameter failed");
+    }
     super(opts, mode, handle, zstdDefaultOpts);
     this._writeState = writeState;
   }
@@ -1060,65 +1270,51 @@ ObjectDefineProperty(binding.Zlib.prototype, "jsref", {
   },
 });
 
-export {
-  BrotliCompress,
-  BrotliDecompress,
-  crc32,
-  Deflate,
-  DeflateRaw,
-  Gunzip,
-  Gzip,
-  Inflate,
-  InflateRaw,
-  Unzip,
-  ZstdCompress,
-  ZstdDecompress,
-};
 // Convenience methods
-export const deflate = createConvenienceMethod(Deflate, false);
-export const deflateSync = createConvenienceMethod(Deflate, true);
-export const gzip = createConvenienceMethod(Gzip, false);
-export const gzipSync = createConvenienceMethod(Gzip, true);
-export const deflateRaw = createConvenienceMethod(DeflateRaw, false);
-export const deflateRawSync = createConvenienceMethod(DeflateRaw, true);
-export const unzip = createConvenienceMethod(Unzip, false);
-export const unzipSync = createConvenienceMethod(Unzip, true);
-export const inflate = createConvenienceMethod(Inflate, false);
-export const inflateSync = createConvenienceMethod(Inflate, true);
-export const gunzip = createConvenienceMethod(Gunzip, false);
-export const gunzipSync = createConvenienceMethod(Gunzip, true);
-export const inflateRaw = createConvenienceMethod(InflateRaw, false);
-export const inflateRawSync = createConvenienceMethod(InflateRaw, true);
-export const brotliCompress = createConvenienceMethod(BrotliCompress, false);
-export const brotliCompressSync = createConvenienceMethod(BrotliCompress, true);
-export const brotliDecompress = createConvenienceMethod(
+const deflate = createConvenienceMethod(Deflate, false);
+const deflateSync = createConvenienceMethod(Deflate, true);
+const gzip = createConvenienceMethod(Gzip, false);
+const gzipSync = createConvenienceMethod(Gzip, true);
+const deflateRaw = createConvenienceMethod(DeflateRaw, false);
+const deflateRawSync = createConvenienceMethod(DeflateRaw, true);
+const unzip = createConvenienceMethod(Unzip, false);
+const unzipSync = createConvenienceMethod(Unzip, true);
+const inflate = createConvenienceMethod(Inflate, false);
+const inflateSync = createConvenienceMethod(Inflate, true);
+const gunzip = createConvenienceMethod(Gunzip, false);
+const gunzipSync = createConvenienceMethod(Gunzip, true);
+const inflateRaw = createConvenienceMethod(InflateRaw, false);
+const inflateRawSync = createConvenienceMethod(InflateRaw, true);
+const brotliCompress = createConvenienceMethod(BrotliCompress, false);
+const brotliCompressSync = createConvenienceMethod(BrotliCompress, true);
+const brotliDecompress = createConvenienceMethod(
   BrotliDecompress,
   false,
 );
-export const brotliDecompressSync = createConvenienceMethod(
+const brotliDecompressSync = createConvenienceMethod(
   BrotliDecompress,
   true,
 );
-export const zstdCompress = createConvenienceMethod(ZstdCompress, false);
-export const zstdCompressSync = createConvenienceMethod(ZstdCompress, true);
-export const zstdDecompress = createConvenienceMethod(ZstdDecompress, false);
-export const zstdDecompressSync = createConvenienceMethod(ZstdDecompress, true);
+const zstdCompress = createConvenienceMethod(ZstdCompress, false);
+const zstdCompressSync = createConvenienceMethod(ZstdCompress, true);
+const zstdDecompress = createConvenienceMethod(ZstdDecompress, false);
+const zstdDecompressSync = createConvenienceMethod(ZstdDecompress, true);
 
 // Factory methods (match Object.defineProperties behavior)
-export const createDeflate = createProperty(Deflate).value;
-export const createInflate = createProperty(Inflate).value;
-export const createDeflateRaw = createProperty(DeflateRaw).value;
-export const createInflateRaw = createProperty(InflateRaw).value;
-export const createGzip = createProperty(Gzip).value;
-export const createGunzip = createProperty(Gunzip).value;
-export const createUnzip = createProperty(Unzip).value;
-export const createBrotliCompress = createProperty(BrotliCompress).value;
-export const createBrotliDecompress = createProperty(BrotliDecompress).value;
-export const createZstdCompress = createProperty(ZstdCompress).value;
-export const createZstdDecompress = createProperty(ZstdDecompress).value;
+const createDeflate = createProperty(Deflate).value;
+const createInflate = createProperty(Inflate).value;
+const createDeflateRaw = createProperty(DeflateRaw).value;
+const createInflateRaw = createProperty(InflateRaw).value;
+const createGzip = createProperty(Gzip).value;
+const createGunzip = createProperty(Gunzip).value;
+const createUnzip = createProperty(Unzip).value;
+const createBrotliCompress = createProperty(BrotliCompress).value;
+const createBrotliDecompress = createProperty(BrotliDecompress).value;
+const createZstdCompress = createProperty(ZstdCompress).value;
+const createZstdDecompress = createProperty(ZstdDecompress).value;
 
 // Deprecated constants: export individually
-export const deprecatedConstants = {};
+const deprecatedConstants = {};
 for (const [key, value] of Object.entries(constants)) {
   if (!key.startsWith("BROTLI")) {
     deprecatedConstants[key] = value;
@@ -1181,4 +1377,5 @@ const zlib = {
   ...deprecatedConstants,
 };
 
-export default Object.freeze(zlib);
+return Object.freeze(zlib);
+})();

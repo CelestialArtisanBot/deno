@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use deno_graph::ModuleSpecifier;
 use deno_graph::packages::JsrPackageInfo;
 use deno_graph::packages::JsrPackageInfoVersion;
 use deno_graph::packages::JsrPackageVersionInfo;
+use deno_graph::packages::JsrVersionResolver;
 use deno_resolver::workspace::WorkspaceResolver;
 use deno_semver::StackString;
 use deno_semver::Version;
@@ -59,7 +60,7 @@ impl JsrCacheResolver {
     let info_by_nv = DashMap::new();
     let info_by_name = DashMap::new();
     let mut workspace_packages_by_name = HashMap::new();
-    for jsr_package in workspace_resolver.jsr_packages() {
+    for jsr_package in workspace_resolver.jsr_packages().iter() {
       let exports = deno_core::serde_json::json!(&jsr_package.exports);
       let version_info = Arc::new(JsrPackageVersionInfo {
         exports: exports.clone(),
@@ -88,10 +89,14 @@ impl JsrCacheResolver {
         Some(Arc::new(JsrPackageInfo {
           versions: [(
             nv.version.clone(),
-            JsrPackageInfoVersion { yanked: false },
+            JsrPackageInfoVersion {
+              yanked: false,
+              created_at: None,
+            },
           )]
           .into_iter()
           .collect(),
+          latest: Some(nv.version.clone()),
         })),
       );
       info_by_nv.insert(nv.clone(), Some(version_info));
@@ -135,11 +140,24 @@ impl JsrCacheResolver {
       // Find the first matching version of the package which is cached.
       let mut versions = package_info.versions.keys().collect::<Vec<_>>();
       versions.sort();
+      // A wildcard requirement matches pre-release versions when the
+      // package has no stable release, same as deno_graph's resolver.
+      let include_all_prereleases =
+        deno_graph::packages::prerelease_fallback_applies(
+          &req.version_req,
+          &package_info,
+        );
       let version = versions
         .into_iter()
         .rev()
         .find(|v| {
-          if req.version_req.tag().is_some() || !req.version_req.matches(v) {
+          if req.version_req.tag().is_some()
+            || !deno_graph::packages::version_matches(
+              &req.version_req,
+              v,
+              include_all_prereleases,
+            )
+          {
             return false;
           }
           let nv = PackageNv {
@@ -177,6 +195,38 @@ impl JsrCacheResolver {
         .join(&format!("{}/{}/{}", &nv.name, &nv.version, &path))
         .ok()
     }
+  }
+
+  pub fn auto_import_resource_urls(
+    &self,
+    req_ref: &JsrPackageReqReference,
+  ) -> Vec<ModuleSpecifier> {
+    let req = req_ref.req().clone();
+    let Some(nv) = self.req_to_nv(&req) else {
+      return Vec::new();
+    };
+    let Some(info) = self.package_version_info(&nv) else {
+      return Vec::new();
+    };
+    let maybe_export_prefix = req_ref.sub_path().map(|s| s.trim_matches('/'));
+    info
+      .exports()
+      .filter_map(|(export, _)| {
+        let export = export.strip_prefix("./").unwrap_or(export);
+        if let Some(export_prefix) = maybe_export_prefix
+          && !export.starts_with(export_prefix)
+        {
+          return None;
+        }
+        let req_ref = if export == "." {
+          JsrPackageReqReference::from_str(&format!("jsr:{req}")).ok()?
+        } else {
+          JsrPackageReqReference::from_str(&format!("jsr:{req}/{export}"))
+            .ok()?
+        };
+        self.jsr_to_resource_url(&req_ref)
+      })
+      .collect()
   }
 
   pub fn lookup_bare_specifier_for_workspace_file(
@@ -323,7 +373,13 @@ pub struct CliJsrSearchApi {
 
 impl CliJsrSearchApi {
   pub fn new(file_fetcher: Arc<CliFileFetcher>) -> Self {
-    let resolver = JsrFetchResolver::new(file_fetcher.clone());
+    let resolver = JsrFetchResolver::new(
+      file_fetcher.clone(),
+      Arc::new(JsrVersionResolver {
+        // not currently supported in the lsp
+        newest_dependency_date_options: Default::default(),
+      }),
+    );
     Self {
       file_fetcher,
       resolver,

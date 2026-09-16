@@ -1,23 +1,32 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::sync::Arc;
 
+use deno_cache_dir::npm::NpmCacheDir;
 use deno_npm::resolution::PackageIdNotFoundError;
 use deno_npm::resolution::ValidSerializedNpmResolutionSnapshot;
 use deno_npm_cache::NpmCache;
 use deno_npm_cache::NpmCacheHttpClient;
 use deno_npm_cache::NpmCacheSetting;
+use deno_npm_cache::NpmCacheSys;
+use deno_npm_cache::NpmPackumentFormat;
 use deno_npm_cache::RegistryInfoProvider;
 use deno_npm_cache::TarballCache;
+use deno_npm_cache::TarballCacheReporter;
+use deno_npmrc::ResolvedNpmRc;
 use deno_resolver::factory::ResolverFactory;
 use deno_resolver::factory::WorkspaceFactory;
 use deno_resolver::factory::WorkspaceFactorySys;
 use deno_resolver::lockfile::LockfileLock;
 use deno_resolver::lockfile::LockfileNpmPackageInfoApiAdapter;
+use deno_semver::jsr::JsrDepPackageReq;
+use deno_semver::package::PackageKind;
+use deno_semver::package::PackageReq;
 use futures::FutureExt;
 
 use crate::LifecycleScriptsConfig;
 use crate::NpmInstaller;
+use crate::NpmInstallerOptions;
 use crate::Reporter;
 use crate::graph::NpmCachingStrategy;
 use crate::graph::NpmDenoGraphResolver;
@@ -25,6 +34,7 @@ use crate::initializer::NpmResolutionInitializer;
 use crate::initializer::NpmResolverManagedSnapshotOption;
 use crate::lifecycle_scripts::LifecycleScriptsExecutor;
 use crate::package_json::NpmInstallDepsProvider;
+use crate::resolution::HasJsExecutionStartedFlagRc;
 use crate::resolution::NpmResolutionInstaller;
 
 // todo(https://github.com/rust-lang/rust/issues/109737): remove once_cell after get_or_try_init is stabilized
@@ -46,9 +56,143 @@ type ResolveNpmResolutionSnapshotFn = Box<
 pub struct NpmInstallerFactoryOptions {
   pub cache_setting: NpmCacheSetting,
   pub caching_strategy: NpmCachingStrategy,
+  pub clean_on_install: bool,
+  /// When loading the npm snapshot from a lockfile, merge equivalent
+  /// peer-dep variants (cycle-unrolling artifacts) onto a single
+  /// canonical entry. Should be true only on install paths — `deno run`
+  /// must not silently rewrite the user's lockfile.
+  pub dedup_lockfile_peer_variants: bool,
   pub lifecycle_scripts_config: LifecycleScriptsConfig,
+  /// Only install production dependencies (excludes devDependencies).
+  pub production: bool,
+  /// Exclude @types/* packages from installation.
+  pub skip_types: bool,
   /// Resolves the npm resolution snapshot from the environment.
   pub resolve_npm_resolution_snapshot: ResolveNpmResolutionSnapshotFn,
+}
+
+pub trait InstallReporter:
+  deno_npm::resolution::Reporter
+  + deno_graph::source::Reporter
+  + deno_npm_cache::TarballCacheReporter
+  + crate::InstallProgressReporter
+{
+}
+
+impl<
+  T: deno_npm::resolution::Reporter
+    + deno_graph::source::Reporter
+    + deno_npm_cache::TarballCacheReporter
+    + crate::InstallProgressReporter,
+> InstallReporter for T
+{
+}
+
+pub struct NpmCacheServices<
+  TNpmCacheHttpClient: NpmCacheHttpClient,
+  TSys: NpmCacheSys,
+> {
+  npm_cache: Arc<NpmCache<TSys>>,
+  registry_info_provider: Arc<RegistryInfoProvider<TNpmCacheHttpClient, TSys>>,
+  tarball_cache: Arc<TarballCache<TNpmCacheHttpClient, TSys>>,
+}
+
+impl<TNpmCacheHttpClient: NpmCacheHttpClient, TSys: NpmCacheSys>
+  NpmCacheServices<TNpmCacheHttpClient, TSys>
+{
+  pub fn new(
+    npm_cache_dir: Arc<NpmCacheDir>,
+    sys: TSys,
+    cache_setting: NpmCacheSetting,
+    npmrc: Arc<ResolvedNpmRc>,
+    http_client: Arc<TNpmCacheHttpClient>,
+    packument_format: NpmPackumentFormat,
+    tarball_cache_reporter: Option<Arc<dyn TarballCacheReporter>>,
+  ) -> Self {
+    let npm_cache = create_npm_cache(
+      npm_cache_dir,
+      sys.clone(),
+      cache_setting,
+      npmrc.clone(),
+    );
+    let registry_info_provider = create_registry_info_provider(
+      npm_cache.clone(),
+      http_client.clone(),
+      npmrc.clone(),
+      packument_format,
+    );
+    let tarball_cache = create_tarball_cache(
+      npm_cache.clone(),
+      http_client,
+      sys,
+      npmrc,
+      tarball_cache_reporter,
+    );
+    Self {
+      npm_cache,
+      registry_info_provider,
+      tarball_cache,
+    }
+  }
+
+  pub fn npm_cache(&self) -> &Arc<NpmCache<TSys>> {
+    &self.npm_cache
+  }
+
+  pub fn registry_info_provider(
+    &self,
+  ) -> &Arc<RegistryInfoProvider<TNpmCacheHttpClient, TSys>> {
+    &self.registry_info_provider
+  }
+
+  pub fn tarball_cache(&self) -> &Arc<TarballCache<TNpmCacheHttpClient, TSys>> {
+    &self.tarball_cache
+  }
+}
+
+fn create_npm_cache<TSys: NpmCacheSys>(
+  npm_cache_dir: Arc<NpmCacheDir>,
+  sys: TSys,
+  cache_setting: NpmCacheSetting,
+  npmrc: Arc<ResolvedNpmRc>,
+) -> Arc<NpmCache<TSys>> {
+  Arc::new(NpmCache::new(npm_cache_dir, sys, cache_setting, npmrc))
+}
+
+fn create_registry_info_provider<
+  TNpmCacheHttpClient: NpmCacheHttpClient,
+  TSys: NpmCacheSys,
+>(
+  npm_cache: Arc<NpmCache<TSys>>,
+  http_client: Arc<TNpmCacheHttpClient>,
+  npmrc: Arc<ResolvedNpmRc>,
+  packument_format: NpmPackumentFormat,
+) -> Arc<RegistryInfoProvider<TNpmCacheHttpClient, TSys>> {
+  Arc::new(RegistryInfoProvider::new(
+    npm_cache,
+    http_client,
+    npmrc,
+    packument_format,
+  ))
+}
+
+fn create_tarball_cache<
+  TNpmCacheHttpClient: NpmCacheHttpClient,
+  TSys: NpmCacheSys,
+>(
+  npm_cache: Arc<NpmCache<TSys>>,
+  http_client: Arc<TNpmCacheHttpClient>,
+  sys: TSys,
+  npmrc: Arc<ResolvedNpmRc>,
+  reporter: Option<Arc<dyn TarballCacheReporter>>,
+) -> Arc<TarballCache<TNpmCacheHttpClient, TSys>> {
+  Arc::new(TarballCache::new(
+    npm_cache,
+    http_client,
+    sys,
+    npmrc,
+    reporter,
+  ))
 }
 
 pub struct NpmInstallerFactory<
@@ -57,7 +201,9 @@ pub struct NpmInstallerFactory<
   TSys: NpmInstallerFactorySys,
 > {
   resolver_factory: Arc<ResolverFactory<TSys>>,
+  has_js_execution_started_flag: HasJsExecutionStartedFlagRc,
   http_client: Arc<TNpmCacheHttpClient>,
+  lifecycle_scripts_config: Deferred<Arc<LifecycleScriptsConfig>>,
   lifecycle_scripts_executor: Arc<dyn LifecycleScriptsExecutor>,
   reporter: TReporter,
   lockfile_npm_package_info_provider:
@@ -77,6 +223,7 @@ pub struct NpmInstallerFactory<
     Deferred<Arc<RegistryInfoProvider<TNpmCacheHttpClient, TSys>>>,
   tarball_cache: Deferred<Arc<TarballCache<TNpmCacheHttpClient, TSys>>>,
   options: NpmInstallerFactoryOptions,
+  install_reporter: Option<Arc<dyn InstallReporter + 'static>>,
 }
 
 impl<
@@ -90,11 +237,14 @@ impl<
     http_client: Arc<TNpmCacheHttpClient>,
     lifecycle_scripts_executor: Arc<dyn LifecycleScriptsExecutor>,
     reporter: TReporter,
+    install_reporter: Option<Arc<dyn InstallReporter + 'static>>,
     options: NpmInstallerFactoryOptions,
   ) -> Self {
     Self {
       resolver_factory,
+      has_js_execution_started_flag: Default::default(),
       http_client,
+      lifecycle_scripts_config: Default::default(),
       lifecycle_scripts_executor,
       reporter,
       lockfile_npm_package_info_provider: Default::default(),
@@ -105,8 +255,13 @@ impl<
       npm_resolution_installer: Default::default(),
       registry_info_provider: Default::default(),
       tarball_cache: Default::default(),
+      install_reporter,
       options,
     }
+  }
+
+  pub fn has_js_execution_started_flag(&self) -> &HasJsExecutionStartedFlagRc {
+    &self.has_js_execution_started_flag
   }
 
   pub fn http_client(&self) -> &Arc<TNpmCacheHttpClient> {
@@ -125,6 +280,66 @@ impl<
         .await?;
     }
     Ok(())
+  }
+
+  pub fn lifecycle_scripts_config(
+    &self,
+  ) -> Result<&Arc<LifecycleScriptsConfig>, anyhow::Error> {
+    use crate::PackagesAllowedScripts;
+
+    fn jsr_deps_to_reqs(deps: Vec<JsrDepPackageReq>) -> Vec<PackageReq> {
+      deps
+        .into_iter()
+        .filter_map(|p| {
+          if p.kind == PackageKind::Npm {
+            Some(p.req)
+          } else {
+            None
+          }
+        })
+        .collect::<Vec<_>>()
+    }
+
+    self.lifecycle_scripts_config.get_or_try_init(|| {
+      let workspace_factory = self.workspace_factory();
+      let workspace = &workspace_factory.workspace_directory()?.workspace;
+      let allow_scripts = workspace.allow_scripts()?;
+      let args = &self.options.lifecycle_scripts_config;
+      Ok(Arc::new(LifecycleScriptsConfig {
+        allowed: match &args.allowed {
+          PackagesAllowedScripts::All => PackagesAllowedScripts::All,
+          PackagesAllowedScripts::Some(package_reqs) => {
+            PackagesAllowedScripts::Some(package_reqs.clone())
+          }
+          PackagesAllowedScripts::None => match allow_scripts.allow {
+            deno_config::deno_json::AllowScriptsValueConfig::All => {
+              PackagesAllowedScripts::All
+            }
+            deno_config::deno_json::AllowScriptsValueConfig::Limited(deps) => {
+              let reqs = jsr_deps_to_reqs(deps);
+              if reqs.is_empty() {
+                PackagesAllowedScripts::None
+              } else {
+                PackagesAllowedScripts::Some(reqs)
+              }
+            }
+          },
+        },
+        denied: match &args.allowed {
+          PackagesAllowedScripts::All | PackagesAllowedScripts::Some(_) => {
+            args.denied.clone()
+          }
+          PackagesAllowedScripts::None => {
+            let mut denied = jsr_deps_to_reqs(allow_scripts.deny);
+            denied.extend(args.denied.clone());
+            denied
+          }
+        },
+        initial_cwd: args.initial_cwd.clone(),
+        root_dir: args.root_dir.clone(),
+        explicit_install: args.explicit_install,
+      }))
+    })
   }
 
   pub fn lockfile_npm_package_info_provider(
@@ -154,12 +369,12 @@ impl<
   pub fn npm_cache(&self) -> Result<&Arc<NpmCache<TSys>>, anyhow::Error> {
     self.npm_cache.get_or_try_init(|| {
       let workspace_factory = self.workspace_factory();
-      Ok(Arc::new(NpmCache::new(
+      Ok(create_npm_cache(
         workspace_factory.npm_cache_dir()?.clone(),
         workspace_factory.sys().clone(),
         self.options.cache_setting.clone(),
         workspace_factory.npmrc()?.clone(),
-      )))
+      ))
     })
   }
 
@@ -196,6 +411,7 @@ impl<
         let workspace_factory = self.workspace_factory();
         Ok(Arc::new(NpmResolutionInitializer::new(
           self.resolver_factory.npm_resolution().clone(),
+          workspace_factory.npmrc()?.clone(),
           workspace_factory.workspace_npm_link_packages()?.clone(),
           match (self.options.resolve_npm_resolution_snapshot)()? {
             Some(snapshot) => {
@@ -203,9 +419,12 @@ impl<
             }
             None => match self.maybe_lockfile().await? {
               Some(lockfile) => {
-                NpmResolverManagedSnapshotOption::ResolveFromLockfile(
-                  lockfile.clone(),
-                )
+                NpmResolverManagedSnapshotOption::ResolveFromLockfile {
+                  lockfile: lockfile.clone(),
+                  dedup_equivalent_peer_variants: self
+                    .options
+                    .dedup_lockfile_peer_variants,
+                }
               }
               None => NpmResolverManagedSnapshotOption::Specified(None),
             },
@@ -225,13 +444,15 @@ impl<
       .npm_resolution_installer
       .get_or_try_init(async move {
         Ok(Arc::new(NpmResolutionInstaller::new(
+          self.has_js_execution_started_flag.clone(),
+          self.resolver_factory.npm_version_resolver()?.clone(),
           self.registry_info_provider()?.clone(),
+          self
+            .install_reporter
+            .as_ref()
+            .map(|r| r.clone() as Arc<dyn deno_npm::resolution::Reporter>),
           self.resolver_factory.npm_resolution().clone(),
           self.maybe_lockfile().await?.cloned(),
-          self
-            .workspace_factory()
-            .workspace_npm_link_packages()?
-            .clone(),
         )))
       })
       .await
@@ -264,10 +485,13 @@ impl<
           let workspace_npm_link_packages =
             workspace_factory.workspace_npm_link_packages()?;
           Ok(Arc::new(NpmInstaller::new(
+            self.install_reporter.clone(),
             self.lifecycle_scripts_executor.clone(),
             npm_cache.clone(),
             Arc::new(NpmInstallDepsProvider::from_workspace(
               &workspace_factory.workspace_directory()?.workspace,
+              self.options.production,
+              self.options.skip_types,
             )),
             registry_info_provider.clone(),
             self.resolver_factory.npm_resolution().clone(),
@@ -276,13 +500,22 @@ impl<
             &self.reporter,
             workspace_factory.sys().clone(),
             self.tarball_cache()?.clone(),
-            self.maybe_lockfile().await?.cloned(),
-            workspace_factory
-              .node_modules_dir_path()?
-              .map(|p| p.to_path_buf()),
-            self.options.lifecycle_scripts_config.clone(),
-            self.resolver_factory.npm_system_info().clone(),
-            workspace_npm_link_packages.clone(),
+            NpmInstallerOptions {
+              clean_on_install: self.options.clean_on_install,
+              maybe_lockfile: self.maybe_lockfile().await?.cloned(),
+              maybe_node_modules_path: workspace_factory
+                .node_modules_dir_path()?
+                .map(|p| p.to_path_buf()),
+              linker_mode: workspace_factory.node_modules_linker_mode()?,
+              lifecycle_scripts: self.lifecycle_scripts_config()?.clone(),
+              system_info: self.resolver_factory.npm_system_info().clone(),
+              workspace_link_packages: workspace_npm_link_packages.clone(),
+              jsr_deps_in_node_modules: workspace_factory
+                .workspace_directory()?
+                .workspace
+                .jsr_deps_in_node_modules()
+                .unwrap_or(false),
+            },
           )))
         }
         .boxed_local(),
@@ -297,11 +530,23 @@ impl<
     anyhow::Error,
   > {
     self.registry_info_provider.get_or_try_init(|| {
-      Ok(Arc::new(RegistryInfoProvider::new(
+      let packument_format = if self
+        .resolver_factory
+        .minimum_dependency_age_config()
+        .ok()
+        .and_then(|c| c.age.as_ref().and_then(|d| d.into_option()))
+        .is_some()
+      {
+        NpmPackumentFormat::Full
+      } else {
+        NpmPackumentFormat::Abbreviated
+      };
+      Ok(create_registry_info_provider(
         self.npm_cache()?.clone(),
         self.http_client().clone(),
         self.workspace_factory().npmrc()?.clone(),
-      )))
+        packument_format,
+      ))
     })
   }
 
@@ -310,12 +555,16 @@ impl<
   ) -> Result<&Arc<TarballCache<TNpmCacheHttpClient, TSys>>, anyhow::Error> {
     self.tarball_cache.get_or_try_init(|| {
       let workspace_factory = self.workspace_factory();
-      Ok(Arc::new(TarballCache::new(
+      Ok(create_tarball_cache(
         self.npm_cache()?.clone(),
         self.http_client.clone(),
         workspace_factory.sys().clone(),
         workspace_factory.npmrc()?.clone(),
-      )))
+        self
+          .install_reporter
+          .as_ref()
+          .map(|r| r.clone() as Arc<dyn deno_npm_cache::TarballCacheReporter>),
+      ))
     })
   }
 

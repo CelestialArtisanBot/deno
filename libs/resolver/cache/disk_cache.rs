@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::ffi::OsStr;
 use std::path::Component;
@@ -136,8 +136,7 @@ impl<TSys: DiskCacheSys> DiskCache<TSys> {
 
 #[cfg(test)]
 mod tests {
-  // ok, testing
-  #[allow(clippy::disallowed_types)]
+  #[allow(clippy::disallowed_types, reason = "ok in tests")]
   use sys_traits::impls::RealSys;
   use test_util::TempDir;
 
@@ -170,7 +169,7 @@ mod tests {
       ),
       (
         "http://localhost:8000/std/http/file_server.ts",
-        "http/localhost_PORT8000/d8300752800fe3f0beda9505dc1c3b5388beb1ee45afd1f1e2c9fc0866df15cf",
+        "http/localhost_port_8000/d8300752800fe3f0beda9505dc1c3b5388beb1ee45afd1f1e2c9fc0866df15cf",
       ),
       (
         "https://deno.land/std/http/file_server.ts",

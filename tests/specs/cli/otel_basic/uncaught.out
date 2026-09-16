@@ -13,11 +13,19 @@ throw new Error("uncaught");
       "body": {
         "stringValue": "log 1\n"
       },
-      "attributes": [],
+      "attributes": [
+        {
+          "key": "log.iostream",
+          "value": {
+            "stringValue": "stdout"
+          }
+        }
+      ],
       "droppedAttributesCount": 0,
       "flags": 0,
       "traceId": "",
-      "spanId": ""
+      "spanId": "",
+      "eventName": ""
     },
     {
       "timeUnixNano": "[WILDLINE]",
@@ -31,7 +39,8 @@ throw new Error("uncaught");
       "droppedAttributesCount": 0,
       "flags": 0,
       "traceId": "",
-      "spanId": ""
+      "spanId": "",
+      "eventName": ""
     }
   ],
   "metrics": []

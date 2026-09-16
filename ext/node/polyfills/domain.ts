@@ -1,12 +1,20 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 // Copyright Joyent and Node contributors. All rights reserved. MIT license.
 // This code has been inspired by https://github.com/bevry/domain-browser/commit/8bce7f4a093966ca850da75b024239ad5d0b33c6
 // deno-lint-ignore-file no-process-global
 
-import { primordials } from "ext:core/mod.js";
-import { ERR_UNHANDLED_ERROR } from "ext:deno_node/internal/errors.ts";
+(function () {
+const { core, primordials } = __bootstrap;
+const { ERR_UNHANDLED_ERROR } = core.loadExtScript(
+  "ext:deno_node/internal/errors.ts",
+);
+const { AsyncHook } = core.loadExtScript(
+  "ext:deno_node/internal/async_hooks.ts",
+);
 const {
+  ArrayPrototypeEvery,
   ArrayPrototypeIndexOf,
+  ArrayPrototypeLastIndexOf,
   ArrayPrototypePush,
   ArrayPrototypeSlice,
   ArrayPrototypeSplice,
@@ -15,31 +23,74 @@ const {
   ObjectDefineProperty,
   ObjectPrototypeIsPrototypeOf,
   ReflectApply,
+  SafeMap,
 } = primordials;
-import { EventEmitter } from "node:events";
+const { EventEmitter } = core.loadExtScript("ext:deno_node/_events.mjs");
 
 function emitError(e) {
   this.emit("error", e);
 }
 
 let stack = [];
-export let _stack = stack;
-export let active = null;
+let _stack = stack;
+let active = null;
 
-export function create() {
+// Map asyncId -> domain for tracking async operations
+const pairing = new SafeMap();
+
+// Async hook to track domain associations across async operations
+const asyncHook = new AsyncHook({
+  init(asyncId, _type, _triggerAsyncId, resource) {
+    if (process.domain !== null && process.domain !== undefined) {
+      // Record which domain this async operation belongs to
+      pairing.set(asyncId, process.domain);
+      // Attach domain to resource
+      if (typeof resource === "object" && resource !== null) {
+        ObjectDefineProperty(resource, "domain", {
+          __proto__: null,
+          configurable: true,
+          enumerable: false,
+          value: process.domain,
+          writable: true,
+        });
+      }
+    }
+  },
+  before(asyncId) {
+    const domain = pairing.get(asyncId);
+    if (domain !== undefined) {
+      domain.enter();
+    }
+  },
+  after(asyncId) {
+    const domain = pairing.get(asyncId);
+    if (domain !== undefined) {
+      domain.exit();
+    }
+  },
+  destroy(asyncId) {
+    pairing.delete(asyncId);
+  },
+});
+
+function create() {
   return new Domain();
 }
 
-export function createDomain() {
+function createDomain() {
   return new Domain();
 }
 
-export class Domain extends EventEmitter {
-  members = [] as EventEmitter[];
+class Domain extends EventEmitter {
+  members = [];
 
   constructor() {
     super();
     patchEventEmitter();
+    asyncHook.enable();
+
+    this.on("removeListener", updateExceptionCapture);
+    this.on("newListener", updateExceptionCapture);
   }
 
   add(ee) {
@@ -79,9 +130,28 @@ export class Domain extends EventEmitter {
     // deno-lint-ignore no-this-alias
     const self = this;
     return function () {
+      self.enter();
       try {
-        return FunctionPrototypeApply(fn, null, ArrayPrototypeSlice(arguments));
+        const ret = FunctionPrototypeApply(
+          fn,
+          this,
+          ArrayPrototypeSlice(arguments),
+        );
+        self.exit();
+        return ret;
       } catch (e) {
+        self.exit();
+        if (typeof e === "object" && e !== null) {
+          e.domainBound = fn;
+          e.domainThrown = false;
+          ObjectDefineProperty(e, "domain", {
+            __proto__: null,
+            configurable: true,
+            enumerable: false,
+            value: self,
+            writable: true,
+          });
+        }
         FunctionPrototypeCall(emitError, self, e);
       }
     };
@@ -92,46 +162,207 @@ export class Domain extends EventEmitter {
     const self = this;
     return function (e) {
       if (e) {
+        if (typeof e === "object" && e !== null) {
+          e.domainBound = fn;
+          e.domainThrown = false;
+          ObjectDefineProperty(e, "domain", {
+            __proto__: null,
+            configurable: true,
+            enumerable: false,
+            value: self,
+            writable: true,
+          });
+        }
         FunctionPrototypeCall(emitError, self, e);
       } else {
+        self.enter();
         try {
-          return FunctionPrototypeApply(
+          const ret = FunctionPrototypeApply(
             fn,
-            null,
+            this,
             ArrayPrototypeSlice(arguments, 1),
           );
+          self.exit();
+          return ret;
         } catch (e) {
+          self.exit();
+          if (typeof e === "object" && e !== null) {
+            e.domainBound = fn;
+            e.domainThrown = false;
+            ObjectDefineProperty(e, "domain", {
+              __proto__: null,
+              configurable: true,
+              enumerable: false,
+              value: self,
+              writable: true,
+            });
+          }
           FunctionPrototypeCall(emitError, self, e);
         }
       }
     };
   }
 
-  run(fn) {
+  run(fn, ...args) {
+    this.enter();
     try {
-      return fn();
+      const ret = FunctionPrototypeApply(fn, this, args);
+      this.exit();
+      return ret;
     } catch (e) {
+      this.exit();
+      if (typeof e === "object" && e !== null) {
+        e.domainThrown = true;
+        ObjectDefineProperty(e, "domain", {
+          __proto__: null,
+          configurable: true,
+          enumerable: false,
+          value: this,
+          writable: true,
+        });
+      }
       FunctionPrototypeCall(emitError, this, e);
     }
-    return this;
   }
 
   dispose() {
+    this._disposed = true;
     this.removeAllListeners();
     return this;
   }
 
   enter() {
+    active = process.domain = this;
+    ArrayPrototypePush(stack, this);
+    updateExceptionCapture();
     return this;
   }
 
   exit() {
+    // Use lastIndexOf (most recent occurrence) and remove everything from that
+    // position onwards. This matches Node.js behavior: exiting a domain also
+    // exits all domains that were entered after its most recent entry.
+    const index = ArrayPrototypeLastIndexOf(stack, this);
+    if (index !== -1) {
+      ArrayPrototypeSplice(stack, index);
+    }
+    active = stack.length === 0 ? null : stack[stack.length - 1];
+    process.domain = active;
+    updateExceptionCapture();
     return this;
   }
 }
 
+let exceptionCaptureActive = false;
+
 function updateExceptionCapture() {
-  // TODO(kt3k): implement this
+  const shouldCapture = !ArrayPrototypeEvery(
+    stack,
+    (domain) => domain.listenerCount("error") === 0,
+  );
+
+  if (shouldCapture && !exceptionCaptureActive) {
+    exceptionCaptureActive = true;
+    process.setUncaughtExceptionCaptureCallback(
+      domainUncaughtExceptionHandler,
+    );
+  } else if (!shouldCapture && exceptionCaptureActive) {
+    exceptionCaptureActive = false;
+    process.setUncaughtExceptionCaptureCallback(null);
+  }
+}
+
+process.on("newListener", (name, listener) => {
+  if (
+    name === "uncaughtException" &&
+    listener !== domainUncaughtExceptionClear
+  ) {
+    // The first uncaughtException listener must clear the domain stack before
+    // user code runs.
+    process.removeListener(name, domainUncaughtExceptionClear);
+    process.prependListener(name, domainUncaughtExceptionClear);
+  }
+});
+
+process.on("removeListener", (name, listener) => {
+  if (
+    name === "uncaughtException" &&
+    listener !== domainUncaughtExceptionClear
+  ) {
+    const listeners = process.listeners("uncaughtException");
+    if (
+      listeners.length === 1 &&
+      listeners[0] === domainUncaughtExceptionClear
+    ) {
+      process.removeListener(name, domainUncaughtExceptionClear);
+    }
+  }
+});
+
+function domainUncaughtExceptionClear() {
+  stack.length = 0;
+  active = process.domain = null;
+  updateExceptionCapture();
+}
+
+function domainUncaughtExceptionHandler(er) {
+  let caught = false;
+  const curDomain = process.domain;
+  if (!curDomain || curDomain._disposed) {
+    // No active domain or domain has been disposed, re-throw
+    throw er;
+  }
+
+  if (typeof er === "object" && er !== null) {
+    ObjectDefineProperty(er, "domain", {
+      __proto__: null,
+      configurable: true,
+      enumerable: false,
+      value: curDomain,
+      writable: true,
+    });
+    er.domainThrown = true;
+  }
+
+  // Run the error handler outside of its domain, but within its parent.
+  // A domain may have been entered more than once, so remove all adjacent
+  // entries for the currently active domain.
+  while (active === curDomain) {
+    curDomain.exit();
+  }
+
+  if (stack.length === 0) {
+    // Without a domain error listener, leave the error for the process-level
+    // uncaughtException handler instead of emitting an error event that throws.
+    if (curDomain.listenerCount("error") > 0) {
+      process.setUncaughtExceptionCaptureCallback(null);
+      try {
+        caught = curDomain.emit("error", er);
+      } finally {
+        updateExceptionCapture();
+      }
+    }
+  } else {
+    try {
+      caught = curDomain.emit("error", er);
+    } catch (handlerError) {
+      // Let the parent domain handle errors thrown by a child domain's handler.
+      // If there is no parent, pass the error on to the process-level handler.
+      updateExceptionCapture();
+      if (stack.length > 0) {
+        active = process.domain = stack[stack.length - 1];
+        caught = domainUncaughtExceptionHandler(handlerError);
+      } else {
+        throw handlerError;
+      }
+    }
+  }
+
+  // An uncaught exception ends the current turn. No entered domains should
+  // remain active when unrelated work begins on a later turn.
+  domainUncaughtExceptionClear();
+
+  return caught;
 }
 
 let patched = false;
@@ -169,13 +400,20 @@ function patchEventEmitter() {
     const shouldEmitError = type === "error" &&
       this.listenerCount(type) > 0;
 
-    // Just call original `emit` if current EE instance has `error`
-    // handler, there's no active domain or this is process
-    if (
-      shouldEmitError || domain === null || domain === undefined ||
-      this === process
-    ) {
+    // No domain on this emitter or this is process - just call original emit
+    if (domain === null || domain === undefined || this === process) {
       return ReflectApply(eventEmit, this, args);
+    }
+
+    // If the emitter has an error handler and a domain, wrap with
+    // domain.enter()/exit() to preserve domain context in the handler.
+    // Only exit on success - on error, the domainUncaughtExceptionHandler
+    // handles cleanup (same pattern as timer async hooks).
+    if (shouldEmitError) {
+      domain.enter();
+      const ret = ReflectApply(eventEmit, this, args);
+      domain.exit();
+      return ret;
     }
 
     if (type === "error") {
@@ -246,10 +484,18 @@ function patchEventEmitter() {
   };
 }
 
-export default {
+return {
+  default: {
+    _stack,
+    create,
+    active,
+    createDomain,
+    Domain,
+  },
   _stack,
   create,
   active,
   createDomain,
   Domain,
 };
+})();

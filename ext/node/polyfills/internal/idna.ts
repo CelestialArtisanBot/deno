@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -45,14 +45,14 @@
 
 // TODO(cmorten): migrate punycode logic to "icu" internal binding and/or "url"
 // internal module so there can be re-use within the "url" module etc.
-
+(function () {
 "use strict";
-
-import {
+const { core, primordials } = __bootstrap;
+const {
+  op_node_idna_to_ascii,
   op_node_idna_domain_to_ascii,
   op_node_idna_domain_to_unicode,
-} from "ext:core/ops";
-import { primordials } from "ext:core/mod.js";
+} = core.ops;
 const {
   ArrayPrototypePush,
   SafeArrayIterator,
@@ -113,21 +113,47 @@ function ucs2encode(array: number[]) {
   return StringFromCodePoint(...new SafeArrayIterator(array));
 }
 
-export const ucs2 = {
+const ucs2 = {
   decode: ucs2decode,
   encode: ucs2encode,
 };
 
 /**
- *  Converts a domain to ASCII as per the IDNA spec
+ *  Converts a domain to ASCII as per the IDNA spec (UTS #46 ToASCII).
+ *  Returns an empty string if the domain is invalid.
+ *
+ *  This is Node's `internal/idna` `toASCII`, used by `node:dns` and `node:tls`.
+ *  Prefer it over `domainToASCII` anywhere a hostname is on its way to a
+ *  resolver: it does not truncate, percent-decode or normalize the host.
  */
-export function domainToASCII(domain: string) {
+function toASCII(domain: string) {
+  return op_node_idna_to_ascii(domain);
+}
+
+/**
+ *  Converts a domain to ASCII the way the WHATWG URL host parser does.
+ *  Returns an empty string if the domain is invalid.
+ *
+ *  This is Node's `url.domainToASCII`, and is deliberately stricter than
+ *  `toASCII`: it terminates the host at `/`, `\`, `?` or `#`, strips ASCII
+ *  tab/newline, percent-decodes, normalizes IPv4/IPv6 literals and rejects
+ *  forbidden host code points.
+ */
+function domainToASCII(domain: string) {
   return op_node_idna_domain_to_ascii(domain);
 }
 
 /**
  *  Converts a domain to Unicode as per the IDNA spec
  */
-export function domainToUnicode(domain: string) {
+function domainToUnicode(domain: string) {
   return op_node_idna_domain_to_unicode(domain);
 }
+
+return {
+  toASCII,
+  domainToASCII,
+  domainToUnicode,
+  ucs2,
+};
+})();

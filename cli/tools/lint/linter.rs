@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -82,6 +82,10 @@ impl CliLinter {
 
   pub fn has_package_rules(&self) -> bool {
     !self.package_rules.is_empty()
+  }
+
+  pub fn has_package_rule(&self, code: &str) -> bool {
+    self.package_rules.iter().any(|r| r.code() == code)
   }
 
   pub fn lint_package(

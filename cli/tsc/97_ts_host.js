@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 // @ts-check
 /// <reference path="./compiler.d.ts" />
@@ -182,7 +182,10 @@ function isNodeSourceFile(sourceFile) {
   return isNodeSourceFile;
 }
 
-ts.deno.setIsNodeSourceFileCallback(isNodeSourceFile);
+// NOTE: Deno now uses a stock (unforked) TypeScript build, which has a single
+// global symbol table. Web-global coexistence with @types/node is handled in
+// the libs via the lib.dom-style conditional-deferral pattern, so the fork's
+// dual node/deno global tables and the `ts.deno.*` global hooks are gone.
 
 /**
  * @param msg {string}
@@ -303,51 +306,8 @@ const CACHE_URL_PREFIX = "cache:///";
 
 /** Diagnostics that are intentionally ignored when compiling TypeScript in
  * Deno, as they provide misleading or incorrect information. */
-const IGNORED_DIAGNOSTICS = [
-  // TS1452: 'resolution-mode' assertions are only supported when `moduleResolution` is `node16` or `nodenext`.
-  // We specify the resolution mode to be CommonJS for some npm files and this
-  // diagnostic gets generated even though we're using custom module resolution.
-  1452,
-  // Module '...' cannot be imported using this construct. The specifier only resolves to an
-  // ES module, which cannot be imported with 'require'.
-  1471,
-  // TS1479: The current file is a CommonJS module whose imports will produce 'require' calls;
-  // however, the referenced file is an ECMAScript module and cannot be imported with 'require'.
-  1479,
-  // TS1543: Importing a JSON file into an ECMAScript module requires a 'type: \"json\"' import
-  // attribute when 'module' is set to 'NodeNext'.
-  1543,
-  // TS2306: File '.../index.d.ts' is not a module.
-  // We get this for `x-typescript-types` declaration files which don't export
-  // anything. We prefer to treat these as modules with no exports.
-  2306,
-  // TS2688: Cannot find type definition file for '...'.
-  // We ignore because type definition files can end with '.ts'.
-  2688,
-  // TS2792: Cannot find module. Did you mean to set the 'moduleResolution'
-  // option to 'node', or to add aliases to the 'paths' option?
-  2792,
-  // TS2307: Cannot find module '{0}' or its corresponding type declarations.
-  2307,
-  // Relative import errors to add an extension
-  2834,
-  2835,
-  // TS5009: Cannot find the common subdirectory path for the input files.
-  5009,
-  // TS5055: Cannot write file
-  // 'http://localhost:4545/subdir/mt_application_x_javascript.j4.js'
-  // because it would overwrite input file.
-  5055,
-  // TypeScript is overly opinionated that only CommonJS modules kinds can
-  // support JSON imports.  Allegedly this was fixed in
-  // Microsoft/TypeScript#26825 but that doesn't seem to be working here,
-  // so we will ignore complaints about this compiler setting.
-  5070,
-  // TS7016: Could not find a declaration file for module '...'. '...'
-  // implicitly has an 'any' type.  This is due to `allowJs` being off by
-  // default but importing of a JavaScript module.
-  7016,
-];
+const TSC_CONSTANTS = ops.op_tsc_constants();
+const IGNORED_DIAGNOSTICS = TSC_CONSTANTS.ignoredDiagnosticCodes;
 
 // todo(dsherret): can we remove this and just use ts.OperationCanceledException?
 /** Error thrown on cancellation. */
@@ -816,6 +776,9 @@ export function filterMapDiagnostic(diagnostic) {
   if (IGNORED_DIAGNOSTICS.includes(diagnostic.code)) {
     return false;
   }
+  if (isJSDocDynamicImportDiagnostic(diagnostic)) {
+    return false;
+  }
   // surface not found diagnostics inside npm packages
   // because we don't analyze it with deno_graph
   if (
@@ -831,116 +794,81 @@ export function filterMapDiagnostic(diagnostic) {
     if (diagnostic.code == 1375 || diagnostic.code == 1431) {
       return false;
     }
-  }
-  // make the diagnostic for using an `export =` in an es module a warning
-  if (diagnostic.code === 1203) {
-    diagnostic.category = ts.DiagnosticCategory.Warning;
-    if (typeof diagnostic.messageText === "string") {
-      const message =
-        " This will start erroring in a future version of Deno 2 " +
-        "in order to align with TypeScript.";
-      // seems typescript shares objects, so check if it's already been set
-      if (!diagnostic.messageText.endsWith(message)) {
-        diagnostic.messageText += message;
-      }
+    // Notebook cells are analyzed as classic scripts so that top-level
+    // declarations are shared between cells. As a side effect, declaring a
+    // top-level binding whose name matches an ambient global from the default
+    // libraries (e.g. `const name = ...` shadowing `declare var name` in
+    // `lib.deno.window.d.ts`) is reported as a redeclaration, even though it's
+    // valid in a notebook. Suppress these when the conflicting declaration
+    // lives in a default library.
+    // See https://github.com/denoland/deno/issues/22628.
+    if (
+      // 2300: Duplicate identifier.
+      // 2403: Subsequent variable declarations must have the same type.
+      // 2451: Cannot redeclare block-scoped variable.
+      (diagnostic.code === 2300 || diagnostic.code === 2403 ||
+        diagnostic.code === 2451) &&
+      diagnostic.relatedInformation?.some((related) =>
+        related.file?.isDeclarationFile &&
+        related.file?.fileName?.startsWith(ASSETS_URL_PREFIX)
+      )
+    ) {
+      return false;
     }
   }
-
   return true;
 }
 
-// list of globals that should be kept in Node's globalThis
-ts.deno.setNodeOnlyGlobalNames(
-  new Set([
-    "__dirname",
-    "__filename",
-    '"buffer"',
-    "Buffer",
-    "BufferConstructor",
-    "BufferEncoding",
-    "clearImmediate",
-    "clearInterval",
-    "clearTimeout",
-    "console",
-    "Console",
-    "crypto",
-    "ErrorConstructor",
-    "gc",
-    "Global",
-    "localStorage",
-    "queueMicrotask",
-    "RequestInit",
-    "ResponseInit",
-    "sessionStorage",
-    "setImmediate",
-    "setInterval",
-    "setTimeout",
-  ]),
-);
-// List of globals in @types/node that collide with Deno's types.
-// When the `@types/node` package attempts to assign to these types
-// if the type is already in the global symbol table, then assignment
-// will be a no-op, but if the global type does not exist then the package can
-// create the global.
-const setTypesNodeIgnorableNames = new Set([
-  "AbortController",
-  "AbortSignal",
-  "AsyncIteratorObject",
-  "atob",
-  "Blob",
-  "BroadcastChannel",
-  "btoa",
-  "ByteLengthQueuingStrategy",
-  "CompressionStream",
-  "CountQueuingStrategy",
-  "DecompressionStream",
-  "Disposable",
-  "DOMException",
-  "Event",
-  "EventSource",
-  "EventTarget",
-  "fetch",
-  "File",
-  "Float32Array",
-  "Float64Array",
-  "FormData",
-  "Headers",
-  "ImportMeta",
-  "MessageChannel",
-  "MessageEvent",
-  "MessagePort",
-  "performance",
-  "PerformanceEntry",
-  "PerformanceMark",
-  "PerformanceMeasure",
-  "ReadableByteStreamController",
-  "ReadableStream",
-  "ReadableStreamBYOBReader",
-  "ReadableStreamBYOBRequest",
-  "ReadableStreamDefaultController",
-  "ReadableStreamDefaultReader",
-  "ReadonlyArray",
-  "Request",
-  "Response",
-  "Storage",
-  "TextDecoder",
-  "TextDecoderStream",
-  "TextEncoder",
-  "TextEncoderStream",
-  "TransformStream",
-  "TransformStreamDefaultController",
-  "URL",
-  "URLSearchParams",
-  "WebSocket",
-  "WritableStream",
-  "WritableStreamDefaultController",
-  "WritableStreamDefaultWriter",
-]);
-ts.deno.setTypesNodeIgnorableNames(setTypesNodeIgnorableNames);
+/** @param {ts.Diagnostic} diagnostic */
+function isJSDocDynamicImportDiagnostic(diagnostic) {
+  if (
+    // TS2307: Cannot find module '{0}' or its corresponding type declarations.
+    diagnostic.code !== 2307 || diagnostic.file == null ||
+    diagnostic.start == null
+  ) {
+    return false;
+  }
+
+  const text = diagnostic.file.text;
+  const commentStart = text.lastIndexOf("/**", diagnostic.start);
+  if (commentStart === -1) {
+    return false;
+  }
+  const commentEndBeforeDiagnostic = text.lastIndexOf(
+    "*/",
+    diagnostic.start,
+  );
+  if (commentEndBeforeDiagnostic > commentStart) {
+    return false;
+  }
+
+  const openBrace = text.lastIndexOf("{", diagnostic.start);
+  const closeBraceBeforeDiagnostic = text.lastIndexOf("}", diagnostic.start);
+  if (openBrace <= commentStart || closeBraceBeforeDiagnostic > openBrace) {
+    return false;
+  }
+
+  if (
+    /@(?:augments|extends|implements|import|param|returns?|satisfies|template|typedef|type)\b/
+      .test(text.slice(commentStart, openBrace))
+  ) {
+    return false;
+  }
+
+  const closeBrace = text.indexOf("}", diagnostic.start);
+  const commentEnd = text.indexOf("*/", diagnostic.start);
+  if (closeBrace === -1 || commentEnd !== -1 && commentEnd < closeBrace) {
+    return false;
+  }
+
+  return /(?:^|[^\w$])import\s*\(\s*["'][^"']+["']/.test(
+    text.slice(openBrace + 1, closeBrace),
+  );
+}
 
 /**
  * @param {ts.StringLiteralLike} node
- * @returns {"text" | "bytes" | undefined}
+ * @returns {"text" | "bytes" | "css" | undefined}
  */
 function getModuleLiteralImportKind(node) {
   const parent = node.parent;
@@ -996,7 +924,7 @@ function getModuleLiteralImportKind(node) {
 
 /**
  * @param {string} specifier
- * @param {"bytes" | "text"} rawKind
+ * @param {"bytes" | "text" | "css"} rawKind
  */
 function appendRawImportFragment(specifier, rawKind) {
   const fragmentIndex = specifier.indexOf("#");
@@ -1023,11 +951,11 @@ function getRawImportAttributeValue(node) {
 
 /**
  * @param {ts.Node} node
- * @returns {"bytes" | "text" | undefined}
+ * @returns {"bytes" | "text" | "css" | undefined}
  */
 function getRawTypeValue(node) {
   return ts.isStringLiteral(node) &&
-      (node.text === "bytes" || node.text === "text")
+      (node.text === "bytes" || node.text === "text" || node.text === "css")
     ? node.text
     : undefined;
 }

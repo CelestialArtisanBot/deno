@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -7,8 +7,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use deno_error::JsErrorBox;
-use deno_runtime::deno_node::NodePermissions;
 use deno_runtime::deno_permissions::OpenAccessKind;
+use deno_runtime::deno_permissions::PermissionsContainer;
 use parking_lot::Mutex;
 
 use crate::sys::DenoLibSys;
@@ -49,7 +49,7 @@ impl<TSys: DenoLibSys> NpmRegistryReadPermissionChecker<TSys> {
   #[must_use = "the resolved return value to mitigate time-of-check to time-of-use issues"]
   pub fn ensure_read_permission<'a>(
     &self,
-    permissions: &mut dyn NodePermissions,
+    permissions: &mut PermissionsContainer,
     path: Cow<'a, Path>,
   ) -> Result<Cow<'a, Path>, JsErrorBox> {
     if permissions.query_read_all() {
@@ -58,6 +58,11 @@ impl<TSys: DenoLibSys> NpmRegistryReadPermissionChecker<TSys> {
 
     match &self.mode {
       NpmRegistryReadPermissionCheckerMode::Byonm => {
+        // Normalize the path to collapse `.` and `..` components before
+        // checking for a `node_modules` ancestor. Otherwise a traversal path
+        // such as `./node_modules/../../../etc/passwd` would slip through the
+        // check and be read without `--allow-read`.
+        let path = deno_path_util::normalize_path(path);
         if path.components().any(|c| c.as_os_str() == "node_modules") {
           Ok(path)
         } else {

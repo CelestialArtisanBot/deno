@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::borrow::Cow;
 
@@ -16,9 +16,8 @@ pub fn module_type_from_media_and_requested_type(
   match requested_module_type {
     RequestedModuleType::Text => ModuleType::Text,
     RequestedModuleType::Bytes => ModuleType::Bytes,
-    RequestedModuleType::None
-    | RequestedModuleType::Other(_)
-    | RequestedModuleType::Json => match media_type {
+    RequestedModuleType::Other(kind) => ModuleType::Other(kind.clone()),
+    RequestedModuleType::None | RequestedModuleType::Json => match media_type {
       MediaType::Json => ModuleType::Json,
       MediaType::Wasm => ModuleType::Wasm,
       _ => ModuleType::JavaScript,

@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 mod npm;
 
@@ -6,12 +6,48 @@ mod npm;
 mod module_loader;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
+use deno_cache_dir::file_fetcher::File;
 use deno_media_type::MediaType;
 #[cfg(all(feature = "graph", feature = "deno_ast"))]
 pub use module_loader::*;
 pub use npm::*;
+use parking_lot::RwLock;
 use url::Url;
+
+fn media_type_name(media_type: MediaType) -> &'static str {
+  match media_type {
+    MediaType::JavaScript
+    | MediaType::Mjs
+    | MediaType::Cjs
+    | MediaType::Jsx => "JavaScript",
+    MediaType::TypeScript
+    | MediaType::Mts
+    | MediaType::Cts
+    | MediaType::Tsx
+    | MediaType::Dts
+    | MediaType::Dmts
+    | MediaType::Dcts => "TypeScript",
+    MediaType::Json => "Json",
+    MediaType::Jsonc => "JsonC",
+    MediaType::Json5 => "Json5",
+    MediaType::Wasm => "Wasm",
+    MediaType::Css => "Css",
+    MediaType::Html => "Html",
+    MediaType::Markdown => "Markdown",
+    MediaType::Sql => "Sql",
+    MediaType::SourceMap => "SourceMap",
+    MediaType::Unknown => "Unknown",
+  }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum AllowJsonImports {
+  Always,
+  #[default]
+  WithAttribute,
+}
 
 #[derive(Debug)]
 pub enum RequestedModuleType<'a> {
@@ -22,9 +58,15 @@ pub enum RequestedModuleType<'a> {
   Other(&'a str),
 }
 
-#[allow(clippy::disallowed_types)]
+#[allow(
+  clippy::disallowed_types,
+  reason = "source text is always stored as Arc<str>"
+)]
 type ArcStr = std::sync::Arc<str>;
-#[allow(clippy::disallowed_types)]
+#[allow(
+  clippy::disallowed_types,
+  reason = "byte content is always stored as Arc<[u8]>"
+)]
 type ArcBytes = std::sync::Arc<[u8]>;
 
 pub enum LoadedModuleOrAsset<'a> {
@@ -58,5 +100,27 @@ impl LoadedModuleSource {
       LoadedModuleSource::String(text) => text.as_bytes(),
       LoadedModuleSource::Bytes(bytes) => bytes,
     }
+  }
+}
+
+#[allow(clippy::disallowed_types, reason = "definition")]
+pub type MemoryFilesRc = deno_maybe_sync::MaybeArc<MemoryFiles>;
+
+#[derive(Debug, Default)]
+pub struct MemoryFiles(RwLock<HashMap<Url, File>>);
+
+impl MemoryFiles {
+  pub fn insert(&self, specifier: Url, file: File) -> Option<File> {
+    self.0.write().insert(specifier, file)
+  }
+
+  pub fn clear(&self) {
+    self.0.write().clear();
+  }
+}
+
+impl deno_cache_dir::file_fetcher::MemoryFiles for MemoryFiles {
+  fn get(&self, specifier: &Url) -> Option<File> {
+    self.0.read().get(specifier).cloned()
   }
 }

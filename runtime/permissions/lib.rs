@@ -1,18 +1,22 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::io::Write;
 use std::net::IpAddr;
 use std::net::Ipv6Addr;
+use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
 use std::string::ToString;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use capacity_builder::StringBuilder;
 use deno_path_util::normalize_path;
@@ -20,7 +24,7 @@ use deno_path_util::url_to_file_path;
 use deno_terminal::colors;
 use deno_unsync::sync::AtomicFlag;
 use fqdn::FQDN;
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -29,26 +33,47 @@ use serde::Serialize;
 use serde::de;
 use url::Url;
 
+pub mod broker;
+mod ipc_pipe;
 pub mod prompter;
+mod runtime_descriptor_parser;
 pub mod which;
-pub use prompter::DeniedPrompter;
-pub use prompter::GetFormattedStackFn;
-use prompter::PERMISSION_EMOJI;
-pub use prompter::PermissionPrompter;
-pub use prompter::PromptCallback;
-pub use prompter::PromptResponse;
-use prompter::permission_prompt;
-pub use prompter::set_prompt_callbacks;
-pub use prompter::set_prompter;
 
+use prompter::MAYBE_CURRENT_STACKTRACE;
+use prompter::PERMISSION_EMOJI;
+use prompter::permission_prompt;
+pub use runtime_descriptor_parser::RuntimePermissionDescriptorParser;
+
+use self::prompter::PromptResponse;
 use self::which::WhichSys;
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum BrokerResponse {
+  Allow,
+  Deny { message: Option<String> },
+}
+
+use self::broker::has_broker;
+use self::broker::maybe_check_with_broker;
+
+pub type OtelAuditFn =
+  fn(permission: &str, value: &str, stack: Option<&[String]>);
+
+pub enum AuditSink {
+  File(Mutex<std::fs::File>),
+  Otel(OtelAuditFn),
+}
+
+pub static AUDIT_SINK: OnceLock<AuditSink> = OnceLock::new();
+
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
-#[error("Requires {access}, {}", format_permission_error(.name))]
+#[error("{}", custom_message.as_ref().cloned().unwrap_or_else(|| format!("Requires {access}, {}", format_permission_error(.name))))]
 #[class("NotCapable")]
 pub struct PermissionDeniedError {
   pub access: String,
   pub name: &'static str,
+  pub custom_message: Option<String>,
+  pub state: PermissionState,
 }
 
 fn format_permission_error(name: &'static str) -> String {
@@ -61,10 +86,67 @@ fn format_permission_error(name: &'static str) -> String {
   }
 }
 
+fn write_audit<T>(flag_name: &str, value: T)
+where
+  T: Serialize,
+{
+  let Some(sink) = AUDIT_SINK.get() else {
+    return;
+  };
+
+  let get_stack = MAYBE_CURRENT_STACKTRACE.lock();
+  let stack = get_stack.as_ref().map(|s| s());
+
+  match sink {
+    AuditSink::File(file) => {
+      let mut file = file.lock();
+
+      let mut map = serde_json::Map::with_capacity(6);
+      let _ = map.insert("v".into(), serde_json::Value::Number(1.into()));
+      let _ = map.insert(
+        "datetime".into(),
+        #[allow(
+          clippy::disallowed_methods,
+          reason = "TODO: support passing in a sys here"
+        )]
+        serde_json::Value::String(
+          chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+      );
+      let _ = map.insert(
+        "permission".into(),
+        serde_json::to_value(flag_name).unwrap(),
+      );
+      let _ = map.insert("value".into(), serde_json::to_value(&value).unwrap());
+
+      if let Some(ref stack) = stack {
+        let _ =
+          map.insert("stack".into(), serde_json::to_value(stack).unwrap());
+      }
+
+      let _ = file.write_all(
+        format!("{}\n", serde_json::to_string(&map).unwrap()).as_bytes(),
+      );
+    }
+    AuditSink::Otel(report_fn) => {
+      let value_str = serde_json::to_value(&value)
+        .map(|v| match v {
+          serde_json::Value::String(s) => s,
+          other => other.to_string(),
+        })
+        .unwrap_or_default();
+
+      report_fn(flag_name, &value_str, stack.as_deref());
+    }
+  }
+}
+
 /// Fast exit from permission check routines if this permission
 /// is in the "fully-granted" state.
-macro_rules! skip_check_if_is_permission_fully_granted {
-  ($this:ident) => {
+macro_rules! audit_and_skip_check_if_is_permission_fully_granted {
+  ($this:expr, $flag_name:expr, $value:expr) => {
+    write_audit($flag_name, $value);
+
     if $this.is_allow_all() {
       return Ok(());
     }
@@ -84,6 +166,8 @@ pub enum PermissionState {
   #[default]
   Prompt = 2,
   Denied = 3,
+  DeniedPartial = 4,
+  Ignored = 5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +285,7 @@ impl PathBufWithRequested {
     }
   }
 
-  pub fn as_path_with_requested(&self) -> PathWithRequested {
+  pub fn as_path_with_requested(&self) -> PathWithRequested<'_> {
     PathWithRequested {
       path: Cow::Borrowed(self.path.as_path()),
       requested: self.requested.as_deref().map(Cow::Borrowed),
@@ -337,8 +421,8 @@ impl AsRef<Path> for CheckedPathBuf {
 /// `TreatAsGranted` is used in place of `TreatAsPartialGranted` when we don't
 /// want to wastefully check for partial denials when, say, checking read
 /// access for a file.
-#[derive(Debug, Eq, PartialEq)]
-#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(clippy::enum_variant_names, reason = "more clear")]
 enum AllowPartial {
   TreatAsGranted,
   TreatAsDenied,
@@ -353,6 +437,14 @@ impl From<bool> for AllowPartial {
       Self::TreatAsDenied
     }
   }
+}
+
+struct PromptOptions<'a> {
+  name: &'static str,
+  msg: &'a str,
+  api_name: Option<&'a str>,
+  info: Option<&'a str>,
+  is_unary: bool,
 }
 
 impl PermissionState {
@@ -370,30 +462,60 @@ impl PermissionState {
         colors::bold(&format!(
           "{}️  Granted {}",
           PERMISSION_EMOJI,
-          Self::fmt_access(name, info)
+          Self::fmt_access(name, info().as_deref())
         ))
       );
     }
   }
 
-  fn fmt_access(
-    name: &'static str,
-    info: impl FnOnce() -> Option<String>,
-  ) -> String {
+  fn fmt_access(name: &'static str, info: Option<&str>) -> String {
     format!(
       "{} access{}",
       name,
-      info().map(|info| format!(" to {info}")).unwrap_or_default(),
+      info.map(|info| format!(" to {info}")).unwrap_or_default(),
     )
   }
 
   fn permission_denied_error(
     name: &'static str,
-    info: impl FnOnce() -> Option<String>,
+    info: Option<&str>,
+    state: PermissionState,
   ) -> PermissionDeniedError {
     PermissionDeniedError {
       access: Self::fmt_access(name, info),
       name,
+      custom_message: None,
+      state,
+    }
+  }
+
+  fn prompt(
+    options: PromptOptions<'_>,
+  ) -> (Result<(), PermissionDeniedError>, bool) {
+    let PromptOptions {
+      name,
+      msg,
+      api_name,
+      info,
+      is_unary,
+    } = options;
+    match permission_prompt(msg, name, api_name, is_unary) {
+      PromptResponse::Allow => {
+        Self::log_perm_access(name, || info.map(|i| i.to_string()));
+        (Ok(()), false)
+      }
+      PromptResponse::AllowAll => {
+        Self::log_perm_access(name, || info.map(|i| i.to_string()));
+        (Ok(()), true)
+      }
+      PromptResponse::Deny => (
+        Err(Self::permission_denied_error(
+          name,
+          info,
+          PermissionState::Denied,
+        )),
+        false,
+      ),
     }
   }
 
@@ -402,53 +524,60 @@ impl PermissionState {
     self,
     name: &'static str,
     api_name: Option<&str>,
+    stringify_value_fn: impl Fn() -> Option<String>,
     info: impl Fn() -> Option<String>,
     prompt: bool,
   ) -> (Result<(), PermissionDeniedError>, bool, bool) {
+    if let Some(resp) = maybe_check_with_broker(name, &stringify_value_fn) {
+      match resp {
+        BrokerResponse::Allow => {
+          Self::log_perm_access(name, info);
+          return (Ok(()), false, false);
+        }
+        BrokerResponse::Deny { message } => {
+          return (
+            Err(PermissionDeniedError {
+              access: Self::fmt_access(name, info().as_deref()),
+              name,
+              custom_message: message,
+              state: PermissionState::Denied,
+            }),
+            false,
+            false,
+          );
+        }
+      }
+    }
+
     match self {
       PermissionState::Granted => {
         Self::log_perm_access(name, info);
         (Ok(()), false, false)
       }
       PermissionState::Prompt if prompt => {
-        let msg = {
-          let info = info();
-          StringBuilder::<String>::build(|builder| {
-            builder.append(name);
-            builder.append(" access");
-            if let Some(info) = &info {
-              builder.append(" to ");
-              builder.append(info);
-            }
-          })
-          .unwrap()
-        };
-        match permission_prompt(&msg, name, api_name, true) {
-          PromptResponse::Allow => {
-            Self::log_perm_access(name, info);
-            (Ok(()), true, false)
+        let info = info();
+        let msg = StringBuilder::<String>::build(|builder| {
+          builder.append(name);
+          builder.append(" access");
+          if let Some(info) = &info {
+            builder.append(" to ");
+            builder.append(info);
           }
-          PromptResponse::AllowAll => {
-            Self::log_perm_access(name, info);
-            (Ok(()), true, true)
-          }
-          PromptResponse::Deny => {
-            (Err(Self::permission_denied_error(name, info)), true, false)
-          }
-        }
+        })
+        .unwrap();
+        let (result, is_allow_all) = Self::prompt(PromptOptions {
+          name,
+          msg: &msg,
+          api_name,
+          info: info.as_deref(),
+          is_unary: true,
+        });
+        (result, true, is_allow_all)
       }
-      _ => (Err(Self::permission_denied_error(name, info)), false, false),
-    }
-  }
-}
-
-impl fmt::Display for PermissionState {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match self {
-      PermissionState::Granted => f.pad("granted"),
-      PermissionState::GrantedPartial => f.pad("granted-partial"),
-      PermissionState::Prompt => f.pad("prompt"),
-      PermissionState::Denied => f.pad("denied"),
+      state => {
+        let err = Self::permission_denied_error(name, info().as_deref(), state);
+        (Err(err), false, false)
+      }
     }
   }
 }
@@ -493,10 +622,13 @@ impl UnitPermission {
 
   pub fn check(
     &mut self,
+    stringify_value_fn: impl Fn() -> Option<String>,
     info: impl Fn() -> Option<String>,
   ) -> Result<(), PermissionDeniedError> {
     let (result, prompted, _is_allow_all) =
-      self.state.check(self.name, None, info, self.prompt);
+      self
+        .state
+        .check(self.name, None, stringify_value_fn, info, self.prompt);
     if prompted {
       if result.is_ok() {
         self.state = PermissionState::Granted;
@@ -506,36 +638,11 @@ impl UnitPermission {
     }
     result
   }
-
-  fn create_child_permissions(
-    &mut self,
-    flag: ChildUnitPermissionArg,
-  ) -> Result<Self, ChildPermissionError> {
-    let mut perm = self.clone();
-    match flag {
-      ChildUnitPermissionArg::Inherit => {
-        // copy
-      }
-      ChildUnitPermissionArg::Granted => {
-        if self.check(|| None).is_err() {
-          return Err(ChildPermissionError::Escalation);
-        }
-        perm.state = PermissionState::Granted;
-      }
-      ChildUnitPermissionArg::NotGranted => {
-        perm.state = PermissionState::Prompt;
-      }
-    }
-    if self.state == PermissionState::Denied {
-      perm.state = PermissionState::Denied;
-    }
-    Ok(perm)
-  }
 }
 
 /// A normalized environment variable name. On Windows this will
 /// be uppercase and on other platforms it will stay as-is.
-#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd)]
 pub struct EnvVarName {
   inner: String,
 }
@@ -598,16 +705,21 @@ impl PartialEq<EnvVarNameRef<'_>> for EnvVarName {
 pub trait AllowDescriptor: Debug + Eq + Clone + Hash {
   type QueryDesc<'a>: QueryDescriptor<AllowDesc = Self, DenyDesc = Self::DenyDesc>;
   type DenyDesc: DenyDescriptor;
+
+  fn cmp_allow(&self, other: &Self) -> Ordering;
+  fn cmp_deny(&self, other: &Self::DenyDesc) -> Ordering;
 }
 
-pub trait DenyDescriptor: Debug + Eq + Clone + Hash {}
+pub trait DenyDescriptor: Debug + Eq + Clone + Hash {
+  fn cmp_deny(&self, other: &Self) -> Ordering;
+}
 
 pub trait QueryDescriptor: Debug {
   type AllowDesc: AllowDescriptor;
   type DenyDesc: DenyDescriptor;
 
   fn flag_name() -> &'static str;
-  fn display_name(&self) -> Cow<str>;
+  fn display_name(&self) -> Cow<'_, str>;
 
   fn from_allow(allow: &Self::AllowDesc) -> Self;
 
@@ -617,7 +729,7 @@ pub trait QueryDescriptor: Debug {
   /// Generic check function to check this descriptor against a `UnaryPermission`.
   fn check_in_permission(
     &self,
-    perm: &mut UnaryPermission<Self::AllowDesc, Self::DenyDesc>,
+    perm: &mut UnaryPermission<Self::AllowDesc>,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError>;
 
@@ -630,7 +742,7 @@ pub trait QueryDescriptor: Debug {
   fn overlaps_deny(&self, other: &Self::DenyDesc) -> bool;
 }
 
-fn format_display_name(display_name: Cow<str>) -> Cow<str> {
+fn format_display_name(display_name: Cow<'_, str>) -> Cow<'_, str> {
   if display_name.starts_with('<') && display_name.ends_with('>') {
     display_name
   } else {
@@ -638,47 +750,214 @@ fn format_display_name(display_name: Cow<str>) -> Cow<str> {
   }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum AllowOrDenyDescRef<'a, TAllowDesc: AllowDescriptor> {
+  Allow(&'a TAllowDesc),
+  Deny {
+    desc: &'a TAllowDesc::DenyDesc,
+    order: u8,
+  },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum UnaryPermissionDesc<TAllowDesc: AllowDescriptor> {
+  Granted(TAllowDesc),
+  FlagDenied(TAllowDesc::DenyDesc),
+  FlagIgnored(TAllowDesc::DenyDesc),
+  PromptDenied(TAllowDesc::DenyDesc),
+}
+
+impl<TAllowDesc: AllowDescriptor> std::cmp::PartialOrd
+  for UnaryPermissionDesc<TAllowDesc>
+{
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl<TAllowDesc: AllowDescriptor> std::cmp::Ord
+  for UnaryPermissionDesc<TAllowDesc>
+{
+  fn cmp(&self, other: &Self) -> Ordering {
+    match self.allow_or_deny_desc() {
+      AllowOrDenyDescRef::Allow(self_desc) => {
+        match other.allow_or_deny_desc() {
+          AllowOrDenyDescRef::Allow(other_desc) => {
+            self_desc.cmp_allow(other_desc)
+          }
+          AllowOrDenyDescRef::Deny {
+            desc: other_desc, ..
+          } => match self_desc.cmp_deny(other_desc) {
+            Ordering::Equal => {
+              self.kind_precedence().cmp(&other.kind_precedence())
+            }
+            ord => ord,
+          },
+        }
+      }
+      AllowOrDenyDescRef::Deny {
+        desc: self_desc,
+        order: self_order,
+      } => {
+        match other.allow_or_deny_desc() {
+          AllowOrDenyDescRef::Allow(other_desc) => {
+            match other_desc.cmp_deny(self_desc) {
+              Ordering::Equal => {
+                self.kind_precedence().cmp(&other.kind_precedence())
+              }
+              // flip because we compared the other to self above
+              Ordering::Less => Ordering::Greater,
+              Ordering::Greater => Ordering::Less,
+            }
+          }
+          AllowOrDenyDescRef::Deny {
+            desc: other_desc,
+            order: other_order,
+          } => match self_desc.cmp_deny(other_desc) {
+            Ordering::Equal => self_order.cmp(&other_order),
+            ordering => ordering,
+          },
+        }
+      }
+    }
+  }
+}
+
+impl<TAllowDesc: AllowDescriptor> UnaryPermissionDesc<TAllowDesc> {
+  fn allow_or_deny_desc(&self) -> AllowOrDenyDescRef<'_, TAllowDesc> {
+    match self {
+      UnaryPermissionDesc::Granted(desc) => AllowOrDenyDescRef::Allow(desc),
+      UnaryPermissionDesc::FlagDenied(desc) => {
+        AllowOrDenyDescRef::Deny { desc, order: 0 }
+      }
+      UnaryPermissionDesc::PromptDenied(desc) => {
+        AllowOrDenyDescRef::Deny { desc, order: 1 }
+      }
+      UnaryPermissionDesc::FlagIgnored(desc) => {
+        AllowOrDenyDescRef::Deny { desc, order: 2 }
+      }
+    }
+  }
+
+  fn kind_precedence(&self) -> u8 {
+    match self {
+      UnaryPermissionDesc::FlagDenied(_) => 0,
+      UnaryPermissionDesc::PromptDenied(_) => 1,
+      UnaryPermissionDesc::FlagIgnored(_) => 2,
+      UnaryPermissionDesc::Granted(_) => 3,
+    }
+  }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct UnaryPermissionDescriptors<TAllowDesc: AllowDescriptor> {
+  inner: Vec<UnaryPermissionDesc<TAllowDesc>>,
+  has_flag_denied: bool,
+  has_prompt_denied: bool,
+  has_flag_ignored: bool,
+}
+
+impl<TAllowDesc: AllowDescriptor> Default
+  for UnaryPermissionDescriptors<TAllowDesc>
+{
+  fn default() -> Self {
+    Self {
+      inner: Default::default(),
+      has_flag_denied: false,
+      has_prompt_denied: false,
+      has_flag_ignored: false,
+    }
+  }
+}
+
+impl<TAllowDesc: AllowDescriptor> UnaryPermissionDescriptors<TAllowDesc> {
+  pub fn with_capacity(capacity: usize) -> Self {
+    Self {
+      inner: Vec::with_capacity(capacity),
+      ..Default::default()
+    }
+  }
+
+  pub fn iter(&self) -> impl Iterator<Item = &UnaryPermissionDesc<TAllowDesc>> {
+    self.inner.iter()
+  }
+
+  pub fn has_any_denied_or_ignored(&self) -> bool {
+    self.has_flag_denied || self.has_prompt_denied || self.has_flag_ignored
+  }
+
+  pub fn has_prompt_denied(&self) -> bool {
+    self.has_prompt_denied
+  }
+
+  pub fn insert(&mut self, item: UnaryPermissionDesc<TAllowDesc>) {
+    match &item {
+      UnaryPermissionDesc::Granted(_) => {}
+      UnaryPermissionDesc::FlagDenied(_) => {
+        self.has_flag_denied = true;
+      }
+      UnaryPermissionDesc::FlagIgnored(_) => {
+        self.has_flag_ignored = true;
+      }
+      UnaryPermissionDesc::PromptDenied(_) => {
+        self.has_prompt_denied = true;
+      }
+    }
+    if let Err(insert_index) = self.inner.binary_search(&item) {
+      self.inner.insert(insert_index, item);
+    }
+  }
+
+  pub fn revoke_granted(&mut self, desc: &TAllowDesc::QueryDesc<'_>) {
+    self.inner.retain(|v| match v {
+      UnaryPermissionDesc::Granted(v) => !desc.revokes(v),
+      UnaryPermissionDesc::FlagDenied(_)
+      | UnaryPermissionDesc::FlagIgnored(_)
+      | UnaryPermissionDesc::PromptDenied(_) => true,
+    })
+  }
+
+  pub fn revoke_all_granted(&mut self) {
+    self.inner.retain(|v| match v {
+      UnaryPermissionDesc::Granted(_) => false,
+      UnaryPermissionDesc::FlagDenied(_)
+      | UnaryPermissionDesc::FlagIgnored(_)
+      | UnaryPermissionDesc::PromptDenied(_) => true,
+    })
+  }
+}
+
 #[derive(Debug, Eq, PartialEq)]
-pub struct UnaryPermission<
-  TAllowDesc: AllowDescriptor,
-  TDenyDesc: DenyDescriptor,
-> {
+pub struct UnaryPermission<TAllowDesc: AllowDescriptor> {
   granted_global: bool,
-  granted_list: HashSet<TAllowDesc>,
   flag_denied_global: bool,
-  flag_denied_list: HashSet<TDenyDesc>,
+  flag_ignored_global: bool,
   prompt_denied_global: bool,
-  prompt_denied_list: HashSet<TDenyDesc>,
+  descriptors: UnaryPermissionDescriptors<TAllowDesc>,
   prompt: bool,
 }
 
-impl<TAllowDesc: AllowDescriptor, TDenyDesc: DenyDescriptor> Default
-  for UnaryPermission<TAllowDesc, TDenyDesc>
-{
+impl<TAllowDesc: AllowDescriptor> Default for UnaryPermission<TAllowDesc> {
   fn default() -> Self {
     UnaryPermission {
       granted_global: Default::default(),
-      granted_list: Default::default(),
       flag_denied_global: Default::default(),
-      flag_denied_list: Default::default(),
+      flag_ignored_global: Default::default(),
       prompt_denied_global: Default::default(),
-      prompt_denied_list: Default::default(),
+      descriptors: Default::default(),
       prompt: Default::default(),
     }
   }
 }
 
-impl<TAllowDesc: AllowDescriptor, TDenyDesc: DenyDescriptor> Clone
-  for UnaryPermission<TAllowDesc, TDenyDesc>
-{
+impl<TAllowDesc: AllowDescriptor> Clone for UnaryPermission<TAllowDesc> {
   fn clone(&self) -> Self {
     Self {
       granted_global: self.granted_global,
-      granted_list: self.granted_list.clone(),
       flag_denied_global: self.flag_denied_global,
-      flag_denied_list: self.flag_denied_list.clone(),
+      flag_ignored_global: self.flag_ignored_global,
       prompt_denied_global: self.prompt_denied_global,
-      prompt_denied_list: self.prompt_denied_list.clone(),
+      descriptors: self.descriptors.clone(),
       prompt: self.prompt,
     }
   }
@@ -687,7 +966,7 @@ impl<TAllowDesc: AllowDescriptor, TDenyDesc: DenyDescriptor> Clone
 impl<
   TAllowDesc: AllowDescriptor<DenyDesc = TDenyDesc>,
   TDenyDesc: DenyDescriptor,
-> UnaryPermission<TAllowDesc, TDenyDesc>
+> UnaryPermission<TAllowDesc>
 {
   pub fn allow_all() -> Self {
     Self {
@@ -700,15 +979,20 @@ impl<
     self.granted_global
       && !self.flag_denied_global
       && !self.prompt_denied_global
-      && self.flag_denied_list.is_empty()
-      && self.prompt_denied_list.is_empty()
+      && !self.flag_ignored_global
+      && !self.descriptors.has_any_denied_or_ignored()
+      && !has_broker()
   }
 
   pub fn check_all_api(
     &mut self,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      TAllowDesc::QueryDesc::flag_name(),
+      ()
+    );
     self.check_desc(None, false, api_name)
   }
 
@@ -723,6 +1007,7 @@ impl<
       .check(
         TAllowDesc::QueryDesc::flag_name(),
         api_name,
+        || desc.map(|d| d.display_name().to_string()),
         || desc.map(|d| format_display_name(d.display_name()).into_owned()),
         self.prompt,
       );
@@ -745,32 +1030,82 @@ impl<
     desc: Option<&TAllowDesc::QueryDesc<'_>>,
     allow_partial: AllowPartial,
   ) -> PermissionState {
-    if self.is_flag_denied(desc) || self.is_prompt_denied(desc) {
-      PermissionState::Denied
-    } else if self.is_granted(desc) {
-      match allow_partial {
-        AllowPartial::TreatAsGranted => PermissionState::Granted,
-        AllowPartial::TreatAsDenied => {
-          if self.is_partial_flag_denied(desc) {
-            PermissionState::Denied
-          } else {
-            PermissionState::Granted
-          }
-        }
-        AllowPartial::TreatAsPartialGranted => {
-          if self.is_partial_flag_denied(desc) {
-            PermissionState::GrantedPartial
-          } else {
-            PermissionState::Granted
-          }
-        }
-      }
+    if let Some(state) =
+      self.query_allowed_desc_for_exact_match(desc, allow_partial)
+    {
+      state
+    } else if self.flag_ignored_global {
+      PermissionState::Ignored
     } else if matches!(allow_partial, AllowPartial::TreatAsDenied)
       && self.is_partial_flag_denied(desc)
     {
+      PermissionState::DeniedPartial
+    } else if self.flag_denied_global
+      || desc.is_none()
+        && (self.prompt_denied_global || self.descriptors.has_prompt_denied())
+    {
       PermissionState::Denied
+    } else if self.granted_global {
+      self.query_allowed_desc(desc, allow_partial)
     } else {
       PermissionState::Prompt
+    }
+  }
+
+  fn query_allowed_desc_for_exact_match(
+    &self,
+    desc: Option<&TAllowDesc::QueryDesc<'_>>,
+    allow_partial: AllowPartial,
+  ) -> Option<PermissionState> {
+    let desc = desc?;
+    for item in self.descriptors.iter() {
+      match item {
+        UnaryPermissionDesc::Granted(v) => {
+          if desc.matches_allow(v) {
+            return Some(self.query_allowed_desc(Some(desc), allow_partial));
+          }
+        }
+        UnaryPermissionDesc::FlagDenied(v) => {
+          if desc.matches_deny(v) {
+            return Some(PermissionState::Denied);
+          }
+        }
+        UnaryPermissionDesc::FlagIgnored(v) => {
+          if desc.matches_deny(v) {
+            return Some(PermissionState::Ignored);
+          }
+        }
+        UnaryPermissionDesc::PromptDenied(v) => {
+          if desc.stronger_than_deny(v) {
+            return Some(PermissionState::Denied);
+          }
+        }
+      }
+    }
+    None
+  }
+
+  fn query_allowed_desc(
+    &self,
+    desc: Option<&TAllowDesc::QueryDesc<'_>>,
+    allow_partial: AllowPartial,
+  ) -> PermissionState {
+    match allow_partial {
+      AllowPartial::TreatAsGranted => PermissionState::Granted,
+      AllowPartial::TreatAsDenied => {
+        if self.is_partial_flag_denied(desc) {
+          PermissionState::DeniedPartial
+        } else {
+          PermissionState::Granted
+        }
+      }
+      AllowPartial::TreatAsPartialGranted => {
+        if self.is_partial_flag_denied(desc) {
+          PermissionState::GrantedPartial
+        } else {
+          PermissionState::Granted
+        }
+      }
     }
   }
 
@@ -827,50 +1162,17 @@ impl<
   ) -> PermissionState {
     match desc {
       Some(desc) => {
-        self.granted_list.retain(|v| !desc.revokes(v));
+        self.descriptors.revoke_granted(desc);
       }
       None => {
         self.granted_global = false;
         // Revoke global is a special case where the entire granted list is
         // cleared. It's inconsistent with the granular case where only
         // descriptors stronger than the revoked one are purged.
-        self.granted_list.clear();
+        self.descriptors.revoke_all_granted();
       }
     }
     self.query_desc(desc, AllowPartial::TreatAsPartialGranted)
-  }
-
-  fn is_granted(&self, query: Option<&TAllowDesc::QueryDesc<'_>>) -> bool {
-    match query {
-      Some(query) => {
-        self.granted_global
-          || self.granted_list.iter().any(|v| query.matches_allow(v))
-      }
-      None => self.granted_global,
-    }
-  }
-
-  fn is_flag_denied(&self, query: Option<&TAllowDesc::QueryDesc<'_>>) -> bool {
-    match query {
-      Some(query) => {
-        self.flag_denied_global
-          || self.flag_denied_list.iter().any(|v| query.matches_deny(v))
-      }
-      None => self.flag_denied_global,
-    }
-  }
-
-  fn is_prompt_denied(
-    &self,
-    query: Option<&TAllowDesc::QueryDesc<'_>>,
-  ) -> bool {
-    match query {
-      Some(query) => self
-        .prompt_denied_list
-        .iter()
-        .any(|v| query.stronger_than_deny(v)),
-      None => self.prompt_denied_global || !self.prompt_denied_list.is_empty(),
-    }
   }
 
   fn is_partial_flag_denied(
@@ -878,10 +1180,15 @@ impl<
     query: Option<&TAllowDesc::QueryDesc<'_>>,
   ) -> bool {
     match query {
-      None => !self.flag_denied_list.is_empty(),
-      Some(query) => {
-        self.flag_denied_list.iter().any(|v| query.overlaps_deny(v))
+      None => {
+        self.descriptors.has_flag_denied || self.descriptors.has_flag_ignored
       }
+      Some(query) => self.descriptors.iter().any(|desc| match desc {
+        UnaryPermissionDesc::FlagIgnored(v)
+        | UnaryPermissionDesc::FlagDenied(v) => query.overlaps_deny(v),
+        UnaryPermissionDesc::Granted(_)
+        | UnaryPermissionDesc::PromptDenied(_) => false,
+      }),
     }
   }
 
@@ -899,26 +1206,30 @@ impl<
       }
       None => None,
     };
-    Self::list_insert(desc, &mut self.granted_global, &mut self.granted_list);
+    Self::list_insert(
+      desc.map(UnaryPermissionDesc::Granted),
+      &mut self.granted_global,
+      &mut self.descriptors,
+    );
     true
   }
 
   fn insert_prompt_denied(&mut self, desc: Option<TDenyDesc>) {
     Self::list_insert(
-      desc,
+      desc.map(UnaryPermissionDesc::PromptDenied),
       &mut self.prompt_denied_global,
-      &mut self.prompt_denied_list,
+      &mut self.descriptors,
     );
   }
 
-  fn list_insert<T: Hash + Eq>(
-    desc: Option<T>,
+  fn list_insert(
+    desc: Option<UnaryPermissionDesc<TAllowDesc>>,
     list_global: &mut bool,
-    list: &mut HashSet<T>,
+    descriptors: &mut UnaryPermissionDescriptors<TAllowDesc>,
   ) {
     match desc {
       Some(desc) => {
-        list.insert(desc);
+        descriptors.insert(desc);
       }
       None => *list_global = true,
     }
@@ -928,7 +1239,7 @@ impl<
     &mut self,
     flag: ChildUnaryPermissionArg,
     parse: impl Fn(&str) -> Result<Option<TAllowDesc>, E>,
-  ) -> Result<UnaryPermission<TAllowDesc, TDenyDesc>, ChildPermissionError>
+  ) -> Result<UnaryPermission<TAllowDesc>, ChildPermissionError>
   where
     ChildPermissionError: From<E>,
   {
@@ -946,26 +1257,34 @@ impl<
       }
       ChildUnaryPermissionArg::NotGranted => {}
       ChildUnaryPermissionArg::GrantedList(granted_list) => {
-        perms.granted_list = granted_list
-          .iter()
-          .filter_map(|i| parse(i).transpose())
-          .collect::<Result<_, E>>()?;
-        if !perms.granted_list.iter().all(|desc| {
-          TAllowDesc::QueryDesc::from_allow(desc)
+        for result in granted_list.iter().filter_map(|i| parse(i).transpose()) {
+          let desc = result?;
+          if TAllowDesc::QueryDesc::from_allow(&desc)
             .check_in_permission(self, None)
-            .is_ok()
-        }) {
-          return Err(ChildPermissionError::Escalation);
+            .is_err()
+          {
+            return Err(ChildPermissionError::Escalation);
+          }
+          perms.descriptors.insert(UnaryPermissionDesc::Granted(desc));
         }
       }
     }
     perms.flag_denied_global = self.flag_denied_global;
     perms.prompt_denied_global = self.prompt_denied_global;
     perms.prompt = self.prompt;
-    perms.flag_denied_list.clone_from(&self.flag_denied_list);
-    perms
-      .prompt_denied_list
-      .clone_from(&self.prompt_denied_list);
+    perms.flag_ignored_global = self.flag_ignored_global;
+    for item in self.descriptors.iter() {
+      match item {
+        UnaryPermissionDesc::Granted(_) => {
+          // ignore
+        }
+        UnaryPermissionDesc::FlagDenied(_)
+        | UnaryPermissionDesc::FlagIgnored(_)
+        | UnaryPermissionDesc::PromptDenied(_) => {
+          perms.descriptors.insert(item.clone());
+        }
+      }
+    }
 
     Ok(perms)
   }
@@ -974,6 +1293,9 @@ impl<
 #[derive(Clone, Debug)]
 pub struct PathQueryDescriptor<'a> {
   path: Cow<'a, Path>,
+  /// Lowercased on Windows for case-insensitive comparison; same as `path` on
+  /// other platforms. Used by PartialEq, starts_with, etc.
+  cmp_path: PathBuf,
   /// Custom requested display name when differs from resolved.
   requested: Option<String>,
   is_windows_device_path: bool,
@@ -981,7 +1303,7 @@ pub struct PathQueryDescriptor<'a> {
 
 impl PartialEq for PathQueryDescriptor<'_> {
   fn eq(&self, other: &Self) -> bool {
-    self.path == other.path
+    self.cmp_path == other.cmp_path
   }
 }
 
@@ -989,8 +1311,67 @@ impl Eq for PathQueryDescriptor<'_> {}
 
 impl PartialEq<PathDescriptor> for PathQueryDescriptor<'_> {
   fn eq(&self, other: &PathDescriptor) -> bool {
-    self.path == other.path
+    self.cmp_path == other.cmp_path
   }
+}
+
+/// Returns a normalized copy of the path for filesystem-aware comparison.
+///
+/// - Windows (NTFS): ASCII-lowercased for case-insensitive matching.
+/// - macOS (APFS/HFS+): NFKD-normalized and Unicode-case-folded, because
+///   APFS resolves Unicode-equivalent and case-differing paths to the same
+///   inode (e.g. `ß`/`ss`, `ﬁ`/`fi`, NFC/NFD forms, upper/lower).
+/// - Other platforms: returns a clone (case-sensitive, no normalization).
+#[inline]
+#[cfg(windows)]
+fn comparison_path(path: &Path) -> PathBuf {
+  PathBuf::from(path.to_string_lossy().to_ascii_lowercase())
+}
+
+#[inline]
+#[cfg(target_os = "macos")]
+fn comparison_path(path: &Path) -> PathBuf {
+  use unicode_normalization::UnicodeNormalization;
+  // NFKD handles canonical decomposition (NFC->NFD) and compatibility
+  // decomposition (ligatures like fi->fi). Uppercase then lowercase
+  // approximates Unicode case folding (maps ss->SS->ss, etc.).
+  let s = path.to_string_lossy();
+  let normalized: String = s.nfkd().collect();
+  PathBuf::from(normalized.to_uppercase().to_lowercase())
+}
+
+#[inline]
+#[cfg(not(any(windows, target_os = "macos")))]
+fn comparison_path(path: &Path) -> PathBuf {
+  path.to_path_buf()
+}
+
+/// On Windows, strips a `\\?\` verbatim (extended-length) prefix from a path
+/// when it can be losslessly represented without it, so that the permission
+/// system treats `\\?\C:\foo` and `C:\foo` as the same path. The two forms
+/// refer to the same file, so a grant for one must apply to the other (see
+/// denoland/deno#18597).
+///
+/// `dunce::simplified` only strips the prefix when it is actually safe to do
+/// so: it leaves verbatim paths that contain `.`/`..` components (taken
+/// literally in verbatim mode), reserved device names (e.g. `CON`), or that
+/// are too long to be expressed as a regular path, because those forms are
+/// *not* equivalent to their stripped counterparts.
+#[cfg(windows)]
+#[inline]
+fn strip_verbatim_prefix(path: Cow<'_, Path>) -> Cow<'_, Path> {
+  let simplified = dunce::simplified(path.as_ref());
+  if simplified.as_os_str().len() == path.as_os_str().len() {
+    path
+  } else {
+    Cow::Owned(simplified.to_path_buf())
+  }
+}
+
+#[cfg(not(windows))]
+#[inline]
+fn strip_verbatim_prefix(path: Cow<'_, Path>) -> Cow<'_, Path> {
+  path
 }
 
 impl<'a> PathQueryDescriptor<'a> {
@@ -1002,6 +1383,8 @@ impl<'a> PathQueryDescriptor<'a> {
     if path_bytes.is_empty() {
       return Err(PathResolveError::EmptyPath);
     }
+    let path = strip_verbatim_prefix(path);
+    let path_bytes = path.as_os_str().as_encoded_bytes();
     let is_windows_device_path = cfg!(windows)
       && path_bytes.starts_with(br"\\.\")
       && !path_bytes.contains(&b':');
@@ -1020,14 +1403,17 @@ impl<'a> PathQueryDescriptor<'a> {
         Some(path.to_string_lossy().into_owned()),
       )
     };
+    let cmp_path = comparison_path(&path);
     Ok(Self {
       path,
+      cmp_path,
       requested,
       is_windows_device_path,
     })
   }
 
   pub fn new_known_absolute(path: Cow<'a, Path>) -> Self {
+    let path = strip_verbatim_prefix(path);
     let path_bytes = path.as_os_str().as_encoded_bytes();
     let is_windows_device_path = cfg!(windows)
       && path_bytes.starts_with(br"\\.\")
@@ -1039,8 +1425,10 @@ impl<'a> PathQueryDescriptor<'a> {
     } else {
       normalize_path(path)
     };
+    let cmp_path = comparison_path(&path);
     Self {
       path,
+      cmp_path,
       requested: None,
       is_windows_device_path,
     }
@@ -1054,10 +1442,10 @@ impl<'a> PathQueryDescriptor<'a> {
   }
 
   pub fn starts_with(&self, base: &PathDescriptor) -> bool {
-    self.path.starts_with(&base.path)
+    self.cmp_path.starts_with(&base.cmp_path)
   }
 
-  pub fn display_name(&self) -> Cow<str> {
+  pub fn display_name(&self) -> Cow<'_, str> {
     match &self.requested {
       Some(requested) => Cow::Borrowed(requested.as_str()),
       None => self.path.to_string_lossy(),
@@ -1067,6 +1455,7 @@ impl<'a> PathQueryDescriptor<'a> {
   pub fn as_descriptor(&self) -> PathDescriptor {
     PathDescriptor {
       path: self.path.to_path_buf(),
+      cmp_path: self.cmp_path.clone(),
       requested: self.requested.clone(),
       is_windows_device_path: self.is_windows_device_path,
     }
@@ -1075,6 +1464,7 @@ impl<'a> PathQueryDescriptor<'a> {
   pub fn into_descriptor(self) -> PathDescriptor {
     PathDescriptor {
       path: self.path.into_owned(),
+      cmp_path: self.cmp_path,
       requested: self.requested,
       is_windows_device_path: self.is_windows_device_path,
     }
@@ -1104,7 +1494,7 @@ impl QueryDescriptor for ReadQueryDescriptor<'_> {
     "read"
   }
 
-  fn display_name(&self) -> Cow<str> {
+  fn display_name(&self) -> Cow<'_, str> {
     self.0.display_name()
   }
 
@@ -1122,10 +1512,14 @@ impl QueryDescriptor for ReadQueryDescriptor<'_> {
 
   fn check_in_permission(
     &self,
-    perm: &mut UnaryPermission<Self::AllowDesc, Self::DenyDesc>,
+    perm: &mut UnaryPermission<Self::AllowDesc>,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(perm);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      perm,
+      Self::flag_name(),
+      ()
+    );
     perm.check_desc(Some(self), true, api_name)
   }
 
@@ -1153,6 +1547,9 @@ impl QueryDescriptor for ReadQueryDescriptor<'_> {
 #[derive(Clone, Debug)]
 pub struct PathDescriptor {
   path: PathBuf,
+  /// Lowercased on Windows for case-insensitive comparison; same as `path` on
+  /// other platforms. Used by PartialEq, Hash, starts_with, cmp_*.
+  cmp_path: PathBuf,
   /// Custom requested display name when differs from resolved.
   requested: Option<String>,
   is_windows_device_path: bool,
@@ -1160,7 +1557,7 @@ pub struct PathDescriptor {
 
 impl PartialEq for PathDescriptor {
   fn eq(&self, other: &Self) -> bool {
-    self.path == other.path
+    self.cmp_path == other.cmp_path
   }
 }
 
@@ -1168,7 +1565,7 @@ impl Eq for PathDescriptor {}
 
 impl Hash for PathDescriptor {
   fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-    self.path.hash(state);
+    self.cmp_path.hash(state);
   }
 }
 
@@ -1181,6 +1578,7 @@ impl PathDescriptor {
   }
 
   pub fn new_known_cwd(path: Cow<'_, Path>, cwd: &Path) -> Self {
+    let path = strip_verbatim_prefix(path);
     let path_bytes = path.as_os_str().as_encoded_bytes();
     let is_windows_device_path = cfg!(windows)
       && path_bytes.starts_with(br"\\.\")
@@ -1197,8 +1595,10 @@ impl PathDescriptor {
         Some(path.to_string_lossy().into_owned()),
       )
     };
+    let cmp_path = comparison_path(&path);
     Self {
       path: path.into_owned(),
+      cmp_path,
       requested: display,
       is_windows_device_path,
     }
@@ -1209,10 +1609,10 @@ impl PathDescriptor {
   }
 
   pub fn starts_with(&self, base: &PathQueryDescriptor) -> bool {
-    self.path.starts_with(&base.path)
+    self.cmp_path.starts_with(&base.cmp_path)
   }
 
-  pub fn display_name(&self) -> Cow<str> {
+  pub fn display_name(&self) -> Cow<'_, str> {
     match &self.requested {
       Some(requested) => Cow::Borrowed(requested.as_str()),
       None => self.path.to_string_lossy(),
@@ -1222,6 +1622,7 @@ impl PathDescriptor {
   pub fn as_query_descriptor(&self) -> PathQueryDescriptor<'static> {
     PathQueryDescriptor {
       path: Cow::Owned(self.path.clone()),
+      cmp_path: self.cmp_path.clone(),
       requested: self.requested.clone(),
       is_windows_device_path: self.is_windows_device_path,
     }
@@ -1238,6 +1639,36 @@ impl PathDescriptor {
   pub fn into_write(self) -> WriteDescriptor {
     WriteDescriptor(self)
   }
+
+  pub fn into_path_buf(self) -> PathBuf {
+    self.path
+  }
+
+  fn cmp_allow_allow(&self, other: &PathDescriptor) -> Ordering {
+    if self.cmp_path == other.cmp_path {
+      Ordering::Equal
+    } else if other.cmp_path.starts_with(&self.cmp_path) {
+      Ordering::Greater
+    } else if self.cmp_path.starts_with(&other.cmp_path) {
+      Ordering::Less
+    } else {
+      self.cmp_path.cmp(&other.cmp_path)
+    }
+  }
+
+  fn cmp_allow_deny(&self, other: &PathDescriptor) -> Ordering {
+    if other.cmp_path.starts_with(&self.cmp_path) {
+      Ordering::Greater
+    } else if self.cmp_path.starts_with(&other.cmp_path) {
+      Ordering::Less
+    } else {
+      Ordering::Greater
+    }
+  }
+
+  fn cmp_deny_deny(&self, other: &PathDescriptor) -> Ordering {
+    self.cmp_allow_allow(other)
+  }
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
@@ -1246,9 +1677,21 @@ pub struct ReadDescriptor(pub PathDescriptor);
 impl AllowDescriptor for ReadDescriptor {
   type QueryDesc<'a> = ReadQueryDescriptor<'a>;
   type DenyDesc = ReadDescriptor;
+
+  fn cmp_allow(&self, other: &Self) -> Ordering {
+    self.0.cmp_allow_allow(&other.0)
+  }
+
+  fn cmp_deny(&self, other: &Self::DenyDesc) -> Ordering {
+    self.0.cmp_allow_deny(&other.0)
+  }
 }
 
-impl DenyDescriptor for ReadDescriptor {}
+impl DenyDescriptor for ReadDescriptor {
+  fn cmp_deny(&self, other: &Self) -> Ordering {
+    self.0.cmp_deny_deny(&other.0)
+  }
+}
 
 #[derive(Clone, Debug)]
 pub struct WriteQueryDescriptor<'a>(pub PathQueryDescriptor<'a>);
@@ -1261,7 +1704,7 @@ impl QueryDescriptor for WriteQueryDescriptor<'_> {
     "write"
   }
 
-  fn display_name(&self) -> Cow<str> {
+  fn display_name(&self) -> Cow<'_, str> {
     self.0.display_name()
   }
 
@@ -1279,10 +1722,14 @@ impl QueryDescriptor for WriteQueryDescriptor<'_> {
 
   fn check_in_permission(
     &self,
-    perm: &mut UnaryPermission<Self::AllowDesc, Self::DenyDesc>,
+    perm: &mut UnaryPermission<Self::AllowDesc>,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(perm);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      perm,
+      Self::flag_name(),
+      ()
+    );
     perm.check_desc(Some(self), true, api_name)
   }
 
@@ -1313,9 +1760,21 @@ pub struct WriteDescriptor(pub PathDescriptor);
 impl AllowDescriptor for WriteDescriptor {
   type QueryDesc<'a> = WriteQueryDescriptor<'a>;
   type DenyDesc = WriteDescriptor;
+
+  fn cmp_allow(&self, other: &Self) -> Ordering {
+    self.0.cmp_allow_allow(&other.0)
+  }
+
+  fn cmp_deny(&self, other: &Self::DenyDesc) -> Ordering {
+    self.0.cmp_allow_deny(&other.0)
+  }
 }
 
-impl DenyDescriptor for WriteDescriptor {}
+impl DenyDescriptor for WriteDescriptor {
+  fn cmp_deny(&self, other: &Self) -> Ordering {
+    self.0.cmp_deny_deny(&other.0)
+  }
+}
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 pub enum SubdomainWildcards {
@@ -1324,13 +1783,27 @@ pub enum SubdomainWildcards {
   Disabled,
 }
 
-#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+/// Normalize IPv4-mapped IPv6 addresses (e.g. `::ffff:127.0.0.1`) to
+/// their IPv4 equivalent so that permission checks treat them identically
+/// to the bare IPv4 form.
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+  match ip {
+    IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+      Some(v4) => IpAddr::V4(v4),
+      None => IpAddr::V6(v6),
+    },
+    ip => ip,
+  }
+}
+
+#[derive(Clone, Eq, PartialEq, Hash, Debug, PartialOrd, Ord)]
 pub enum Host {
   Fqdn(FQDN),
   FqdnWithSubdomainWildcard(FQDN),
   Ip(IpAddr),
   Vsock(u32),
-  IpSubnet(IpNetwork),
+  IpSubnet(IpNet),
+  UnixSocket(PathBuf),
 }
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
@@ -1350,6 +1823,82 @@ pub enum HostParseError {
   },
 }
 
+/// `--allow-net=unix:<path>` rules.
+///
+/// A leading `/` is an absolute POSIX path on every host, including
+/// `deno compile --target=<unix>` from Windows (`Path::is_absolute()` on
+/// Windows requires a drive letter, so `/var/run/docker.sock` would be
+/// rejected). Otherwise fall back to host semantics so Windows named pipes
+/// (`\\.\pipe\foo`) remain expressible as a scoped rule.
+///
+/// Host-side paths follow `PathQueryDescriptor`: `\\?\` verbatim prefixes
+/// are stripped when lossless, and `\\.\` device paths are passed through
+/// without `normalize_path` (that helper does not preserve the device
+/// prefix). On Windows a leading `\` without a drive (`unix:\foo`) is not
+/// absolute — use a drive letter, `\\.\pipe\name`, or a POSIX `/path`.
+fn parse_unix_socket_allow_path(
+  hostname: &str,
+  rest: &str,
+) -> Result<PathBuf, NetDescriptorParseError> {
+  if rest.is_empty() {
+    return Err(NetDescriptorParseError::InvalidUnixSocket(
+      hostname.to_string(),
+    ));
+  }
+  if rest.starts_with('/') {
+    return Ok(normalize_posix_unix_socket_path(rest));
+  }
+  let path = strip_verbatim_prefix(Cow::Owned(PathBuf::from(rest)));
+  let path_bytes = path.as_os_str().as_encoded_bytes();
+  let is_windows_device_path = cfg!(windows)
+    && path_bytes.starts_with(br"\\.\")
+    && !path_bytes.contains(&b':');
+  if is_windows_device_path {
+    return Ok(path.into_owned());
+  }
+  if path.is_absolute() {
+    return Ok(normalize_path(path).into_owned());
+  }
+  #[cfg(windows)]
+  if rest.starts_with('\\') {
+    return Err(NetDescriptorParseError::InvalidUnixSocketWindowsSlash(
+      hostname.to_string(),
+    ));
+  }
+  Err(NetDescriptorParseError::InvalidUnixSocket(
+    hostname.to_string(),
+  ))
+}
+
+fn normalize_posix_unix_socket_path(path: &str) -> PathBuf {
+  debug_assert!(path.starts_with('/'));
+  let mut out: Vec<&str> = Vec::new();
+  for part in path.split('/') {
+    match part {
+      "" | "." => {}
+      ".." => {
+        let _ = out.pop();
+      }
+      p => out.push(p),
+    }
+  }
+  if out.is_empty() {
+    PathBuf::from("/")
+  } else {
+    PathBuf::from(format!("/{}", out.join("/")))
+  }
+}
+
+/// Strip IPv6 zone index from an address string if present.
+/// (e.g., fe80::1%eth0 or fe80::1%18)
+fn strip_ipv6_zone_index(addr: &str) -> &str {
+  if let Some(idx) = addr.find('%') {
+    &addr[..idx]
+  } else {
+    addr
+  }
+}
+
 impl Host {
   fn parse_for_query(s: &str) -> Result<Self, HostParseError> {
     Self::parse_inner(s, SubdomainWildcards::Disabled)
@@ -1365,21 +1914,26 @@ impl Host {
     subdomain_wildcards: SubdomainWildcards,
   ) -> Result<Self, HostParseError> {
     if s.starts_with('[') && s.ends_with(']') {
-      let ip = s[1..s.len() - 1]
+      let ip_str = &s[1..s.len() - 1];
+      let ip = strip_ipv6_zone_index(ip_str)
         .parse::<Ipv6Addr>()
         .map_err(|_| HostParseError::InvalidIpv6(s.to_string()))?;
-      return Ok(Host::Ip(IpAddr::V6(ip)));
+      return Ok(Host::Ip(normalize_ip(IpAddr::V6(ip))));
     }
     let (without_trailing_dot, has_trailing_dot) =
       s.strip_suffix('.').map_or((s, false), |s| (s, true));
-    if let Ok(ip) = without_trailing_dot.parse::<IpAddr>() {
+
+    let ip_result =
+      strip_ipv6_zone_index(without_trailing_dot).parse::<IpAddr>();
+
+    if let Ok(ip) = ip_result {
       if has_trailing_dot {
         return Err(HostParseError::InvalidHost(
           without_trailing_dot.to_string(),
         ));
       }
-      Ok(Host::Ip(ip))
-    } else if let Ok(ip_subnet) = s.parse::<IpNetwork>() {
+      Ok(Host::Ip(normalize_ip(ip)))
+    } else if let Ok(ip_subnet) = s.parse::<IpNet>() {
       Ok(Host::IpSubnet(ip_subnet))
     } else {
       let lower = if s.chars().all(|c| c.is_ascii_lowercase()) {
@@ -1389,11 +1943,11 @@ impl Host {
       };
       let mut host_or_suffix = lower.as_ref();
       let mut has_subdomain_wildcard = false;
-      if matches!(subdomain_wildcards, SubdomainWildcards::Enabled) {
-        if let Some(suffix) = lower.strip_prefix("*.") {
-          host_or_suffix = suffix;
-          has_subdomain_wildcard = true;
-        }
+      if matches!(subdomain_wildcards, SubdomainWildcards::Enabled)
+        && let Some(suffix) = lower.strip_prefix("*.")
+      {
+        host_or_suffix = suffix;
+        has_subdomain_wildcard = true;
       }
       let fqdn = {
         use std::str::FromStr;
@@ -1420,7 +1974,7 @@ impl Host {
   }
 }
 
-#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Clone, Eq, PartialEq, Hash, Debug, PartialOrd, Ord)]
 pub struct NetDescriptor(pub Host, pub Option<u32>);
 
 impl QueryDescriptor for NetDescriptor {
@@ -1431,7 +1985,7 @@ impl QueryDescriptor for NetDescriptor {
     "net"
   }
 
-  fn display_name(&self) -> Cow<str> {
+  fn display_name(&self) -> Cow<'_, str> {
     Cow::from(format!("{}", self))
   }
 
@@ -1449,10 +2003,14 @@ impl QueryDescriptor for NetDescriptor {
 
   fn check_in_permission(
     &self,
-    perm: &mut UnaryPermission<Self::AllowDesc, Self::DenyDesc>,
+    perm: &mut UnaryPermission<Self::AllowDesc>,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(perm);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      perm,
+      Self::flag_name(),
+      ()
+    );
     perm.check_desc(Some(self), false, api_name)
   }
 
@@ -1471,13 +2029,28 @@ impl QueryDescriptor for NetDescriptor {
       ) => a == b,
       (Host::Ip(a), Host::Ip(b)) => a == b,
       (Host::Vsock(a), Host::Vsock(b)) => a == b,
-      (Host::IpSubnet(a), Host::Ip(b)) => a.contains(*b),
+      // Allow rules must use the exact spelling. macOS volumes may be either
+      // case-sensitive or case-insensitive, and folding here would broaden an
+      // allow rule on a case-sensitive volume.
+      (Host::UnixSocket(a), Host::UnixSocket(b)) => a == b,
+      (Host::IpSubnet(a), Host::Ip(b)) => a.contains(b),
       _ => false,
     }
   }
 
   fn matches_deny(&self, other: &Self::DenyDesc) -> bool {
-    self.matches_allow(other)
+    if other.1.is_some() && self.1 != other.1 {
+      return false;
+    }
+    match (&other.0, &self.0) {
+      // Deny rules conservatively fold socket paths on platforms whose usual
+      // filesystems are case-insensitive, preventing a case-variant spelling
+      // from bypassing the rule.
+      (Host::UnixSocket(a), Host::UnixSocket(b)) => {
+        comparison_path(a) == comparison_path(b)
+      }
+      _ => self.matches_allow(other),
+    }
   }
 
   fn revokes(&self, other: &Self::AllowDesc) -> bool {
@@ -1496,9 +2069,31 @@ impl QueryDescriptor for NetDescriptor {
 impl AllowDescriptor for NetDescriptor {
   type QueryDesc<'a> = NetDescriptor;
   type DenyDesc = NetDescriptor;
+
+  fn cmp_allow(&self, other: &Self) -> Ordering {
+    match (self.1.is_some(), other.1.is_some()) {
+      (true, false) => Ordering::Less,
+      (false, true) => Ordering::Greater,
+      (true, true) | (false, false) => match self.0.cmp(&other.0) {
+        Ordering::Equal => self.1.cmp(&other.1),
+        ordering => ordering,
+      },
+    }
+  }
+
+  fn cmp_deny(&self, other: &Self::DenyDesc) -> Ordering {
+    match self.cmp_allow(other) {
+      Ordering::Equal => Ordering::Greater,
+      ordering => ordering,
+    }
+  }
 }
 
-impl DenyDescriptor for NetDescriptor {}
+impl DenyDescriptor for NetDescriptor {
+  fn cmp_deny(&self, other: &Self) -> Ordering {
+    self.cmp_allow(other)
+  }
+}
 
 impl NetDescriptor {
   pub fn into_import(self) -> ImportDescriptor {
@@ -1508,7 +2103,7 @@ impl NetDescriptor {
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetDescriptorParseError {
-  #[error("invalid value '{0}': URLs are not supported, only domains and ips")]
+  #[error("invalid value '{0}': URLs are not supported, only domains and IPs")]
   Url(String),
   #[error("invalid IPv6 address in '{hostname}': '{ip}'")]
   InvalidIpv6 { hostname: String, ip: String },
@@ -1524,6 +2119,12 @@ pub enum NetDescriptorParseError {
   Host(#[from] HostParseError),
   #[error("invalid vsock: '{0}'")]
   InvalidVsock(String),
+  #[error("invalid unix socket: '{0}' (path must be absolute and non-empty)")]
+  InvalidUnixSocket(String),
+  #[error(
+    "invalid unix socket: '{0}' (on Windows a leading '\\' is not an absolute path; use a drive letter, \\\\.\\pipe\\name, or a POSIX /path)"
+  )]
+  InvalidUnixSocketWindowsSlash(String),
 }
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
@@ -1571,19 +2172,33 @@ impl NetDescriptor {
       return Ok(NetDescriptor(Host::Vsock(cid), Some(port)));
     }
 
+    if let Some(rest) = hostname.strip_prefix("unix:") {
+      let path = parse_unix_socket_allow_path(hostname, rest)?;
+      return Ok(NetDescriptor(Host::UnixSocket(path), None));
+    }
+
     if hostname.starts_with("http://") || hostname.starts_with("https://") {
       return Err(NetDescriptorParseError::Url(hostname.to_string()));
+    }
+
+    if let Ok(socket) = hostname.parse::<SocketAddr>() {
+      return Ok(NetDescriptor(
+        Host::Ip(normalize_ip(socket.ip())),
+        Some(socket.port().into()),
+      ));
     }
 
     // If this is a IPv6 address enclosed in square brackets, parse it as such.
     if hostname.starts_with('[') {
       if let Some((ip, after)) = hostname.split_once(']') {
-        let ip = ip[1..].parse::<Ipv6Addr>().map_err(|_| {
-          NetDescriptorParseError::InvalidIpv6 {
-            hostname: hostname.to_string(),
-            ip: ip.to_string(),
-          }
-        })?;
+        let ip_str = &ip[1..];
+        let ip =
+          strip_ipv6_zone_index(ip_str)
+            .parse::<Ipv6Addr>()
+            .map_err(|_| NetDescriptorParseError::InvalidIpv6 {
+              hostname: hostname.to_string(),
+              ip: ip_str.to_string(),
+            })?;
         let port = if let Some(port) = after.strip_prefix(':') {
           let port = port.parse::<u16>().map_err(|_| {
             NetDescriptorParseError::InvalidPort {
@@ -1600,7 +2215,7 @@ impl NetDescriptor {
           ));
         };
         return Ok(NetDescriptor(
-          Host::Ip(IpAddr::V6(ip)),
+          Host::Ip(normalize_ip(IpAddr::V6(ip))),
           port.map(Into::into),
         ));
       } else {
@@ -1668,6 +2283,7 @@ impl fmt::Display for NetDescriptor {
       Host::Ip(IpAddr::V4(ip)) => write!(f, "{ip}"),
       Host::Ip(IpAddr::V6(ip)) => write!(f, "[{ip}]"),
       Host::Vsock(cid) => write!(f, "vsock:{cid}"),
+      Host::UnixSocket(path) => write!(f, "unix:{}", path.display()),
     }?;
     if let Some(port) = self.1 {
       write!(f, ":{}", port)?;
@@ -1687,7 +2303,7 @@ impl QueryDescriptor for ImportDescriptor {
     "import"
   }
 
-  fn display_name(&self) -> Cow<str> {
+  fn display_name(&self) -> Cow<'_, str> {
     self.0.display_name()
   }
 
@@ -1705,10 +2321,14 @@ impl QueryDescriptor for ImportDescriptor {
 
   fn check_in_permission(
     &self,
-    perm: &mut UnaryPermission<Self::AllowDesc, Self::DenyDesc>,
+    perm: &mut UnaryPermission<Self::AllowDesc>,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(perm);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      perm,
+      Self::flag_name(),
+      ()
+    );
     perm.check_desc(Some(self), false, api_name)
   }
 
@@ -1748,9 +2368,21 @@ impl ImportDescriptor {
 impl AllowDescriptor for ImportDescriptor {
   type QueryDesc<'a> = ImportDescriptor;
   type DenyDesc = ImportDescriptor;
+
+  fn cmp_allow(&self, other: &Self) -> Ordering {
+    self.0.cmp_allow(&other.0)
+  }
+
+  fn cmp_deny(&self, other: &Self::DenyDesc) -> Ordering {
+    AllowDescriptor::cmp_deny(&self.0, &other.0)
+  }
 }
 
-impl DenyDescriptor for ImportDescriptor {}
+impl DenyDescriptor for ImportDescriptor {
+  fn cmp_deny(&self, other: &Self) -> Ordering {
+    DenyDescriptor::cmp_deny(&self.0, &other.0)
+  }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("Empty env not allowed")]
@@ -1760,6 +2392,22 @@ pub struct EnvDescriptorParseError;
 pub enum EnvDescriptor {
   Name(EnvVarName),
   PrefixPattern(EnvVarName),
+}
+
+fn cmp_env_descriptor(a: &EnvDescriptor, b: &EnvDescriptor) -> Ordering {
+  match a {
+    EnvDescriptor::Name(self_name) => match b {
+      EnvDescriptor::Name(other_name) => self_name.cmp(other_name),
+      EnvDescriptor::PrefixPattern(_) => Ordering::Less,
+    },
+    EnvDescriptor::PrefixPattern(self_pattern) => match b {
+      EnvDescriptor::Name(_) => Ordering::Greater,
+      // for patterns, prefer more specific items first
+      EnvDescriptor::PrefixPattern(other_pattern) => {
+        other_pattern.cmp(self_pattern)
+      }
+    },
+  }
 }
 
 impl EnvDescriptor {
@@ -1775,9 +2423,24 @@ impl EnvDescriptor {
 impl AllowDescriptor for EnvDescriptor {
   type QueryDesc<'a> = EnvQueryDescriptor<'a>;
   type DenyDesc = EnvDescriptor;
+
+  fn cmp_allow(&self, other: &Self) -> Ordering {
+    cmp_env_descriptor(self, other)
+  }
+
+  fn cmp_deny(&self, other: &Self::DenyDesc) -> Ordering {
+    match cmp_env_descriptor(self, other) {
+      Ordering::Equal => Ordering::Greater,
+      ordering => ordering,
+    }
+  }
 }
 
-impl DenyDescriptor for EnvDescriptor {}
+impl DenyDescriptor for EnvDescriptor {
+  fn cmp_deny(&self, other: &Self) -> Ordering {
+    cmp_env_descriptor(self, other)
+  }
+}
 
 #[derive(Clone, Debug)]
 enum EnvQueryDescriptorInner<'a> {
@@ -1802,7 +2465,7 @@ impl QueryDescriptor for EnvQueryDescriptor<'_> {
     "env"
   }
 
-  fn display_name(&self) -> Cow<str> {
+  fn display_name(&self) -> Cow<'_, str> {
     Cow::from(match &self.0 {
       EnvQueryDescriptorInner::Name(env_var_name) => env_var_name.as_ref(),
       EnvQueryDescriptorInner::PrefixPattern(env_var_name) => {
@@ -1846,10 +2509,14 @@ impl QueryDescriptor for EnvQueryDescriptor<'_> {
 
   fn check_in_permission(
     &self,
-    perm: &mut UnaryPermission<Self::AllowDesc, Self::DenyDesc>,
+    perm: &mut UnaryPermission<Self::AllowDesc>,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(perm);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      perm,
+      Self::flag_name(),
+      ()
+    );
     perm.check_desc(Some(self), false, api_name)
   }
 
@@ -1998,7 +2665,7 @@ impl<'a> RunQueryDescriptor<'a> {
     requested: &'a str,
     sys: &impl which::WhichSys,
   ) -> Result<Self, PathResolveError> {
-    if is_path(requested) {
+    if AllowRunDescriptor::is_path(requested) {
       let path = Path::new(requested);
       let resolved = PathQueryDescriptor::new(sys, Cow::Borrowed(path))?;
       Ok(RunQueryDescriptor::Path(resolved))
@@ -2008,11 +2675,15 @@ impl<'a> RunQueryDescriptor<'a> {
         .map_err(PathResolveError::CwdResolve)?;
       match which::which_in(sys.clone(), requested, sys.env_var_os("PATH"), cwd)
       {
-        Ok(resolved) => Ok(RunQueryDescriptor::Path(PathQueryDescriptor {
-          path: Cow::Owned(resolved),
-          requested: Some(requested.to_string()),
-          is_windows_device_path: false,
-        })),
+        Ok(resolved) => {
+          let cmp_path = comparison_path(&resolved);
+          Ok(RunQueryDescriptor::Path(PathQueryDescriptor {
+            path: Cow::Owned(resolved),
+            cmp_path,
+            requested: Some(requested.to_string()),
+            is_windows_device_path: false,
+          }))
+        }
         Err(_) => Ok(RunQueryDescriptor::Name(requested.to_string())),
       }
     }
@@ -2027,7 +2698,7 @@ impl QueryDescriptor for RunQueryDescriptor<'_> {
     "run"
   }
 
-  fn display_name(&self) -> Cow<str> {
+  fn display_name(&self) -> Cow<'_, str> {
     match self {
       RunQueryDescriptor::Path(path) => path.display_name(),
       RunQueryDescriptor::Name(name) => Cow::Borrowed(name),
@@ -2067,10 +2738,14 @@ impl QueryDescriptor for RunQueryDescriptor<'_> {
 
   fn check_in_permission(
     &self,
-    perm: &mut UnaryPermission<Self::AllowDesc, Self::DenyDesc>,
+    perm: &mut UnaryPermission<Self::AllowDesc>,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(perm);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      perm,
+      Self::flag_name(),
+      ()
+    );
     perm.check_desc(Some(self), false, api_name)
   }
 
@@ -2105,7 +2780,7 @@ impl QueryDescriptor for RunQueryDescriptor<'_> {
           return true;
         }
         match &path.requested {
-          Some(requested) if is_path(requested) => false,
+          Some(requested) if AllowRunDescriptor::is_path(requested) => false,
           None => false, // is path
           Some(requested) => denies_run_name(requested, &other.0.path),
         }
@@ -2129,7 +2804,7 @@ pub enum RunDescriptorArg {
 }
 
 pub enum AllowRunDescriptorParseResult {
-  /// An error occured getting the descriptor that should
+  /// An error occurred getting the descriptor that should
   /// be surfaced as a warning when launching deno, but should
   /// be ignored when creating a worker.
   Unresolved(Box<which::Error>),
@@ -2158,7 +2833,7 @@ impl AllowRunDescriptor {
     cwd: &Path,
     sys: &impl WhichSys,
   ) -> Result<AllowRunDescriptorParseResult, which::Error> {
-    let is_path = is_path(text);
+    let is_path = Self::is_path(text);
     let path = if is_path {
       Cow::Borrowed(Path::new(text))
     } else {
@@ -2187,11 +2862,30 @@ impl AllowRunDescriptor {
       AllowRunDescriptor(path),
     ))
   }
+
+  pub fn is_path(text: &str) -> bool {
+    if cfg!(windows) {
+      text.contains('/') || text.contains('\\') || Path::new(text).is_absolute()
+    } else {
+      text.contains('/')
+    }
+  }
 }
 
 impl AllowDescriptor for AllowRunDescriptor {
   type QueryDesc<'a> = RunQueryDescriptor<'a>;
   type DenyDesc = DenyRunDescriptor;
+
+  fn cmp_allow(&self, other: &Self) -> Ordering {
+    self.0.cmp_allow_allow(&other.0)
+  }
+
+  fn cmp_deny(&self, other: &Self::DenyDesc) -> Ordering {
+    match other {
+      DenyRunDescriptor::Name(_) => Ordering::Less,
+      DenyRunDescriptor::Path(_) => Ordering::Greater,
+    }
+  }
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
@@ -2204,7 +2898,22 @@ pub enum DenyRunDescriptor {
   Path(PathDescriptor),
 }
 
-impl DenyDescriptor for DenyRunDescriptor {}
+impl DenyDescriptor for DenyRunDescriptor {
+  fn cmp_deny(&self, other: &Self) -> Ordering {
+    match self {
+      DenyRunDescriptor::Name(self_name) => match other {
+        DenyRunDescriptor::Name(other_name) => self_name.cmp(other_name),
+        DenyRunDescriptor::Path(_) => Ordering::Greater,
+      },
+      DenyRunDescriptor::Path(self_path) => match other {
+        DenyRunDescriptor::Name(_) => Ordering::Less,
+        DenyRunDescriptor::Path(other_path) => {
+          self_path.cmp_deny_deny(other_path)
+        }
+      },
+    }
+  }
+}
 
 impl DenyRunDescriptor {
   pub fn parse(text: &str, cwd: &Path) -> Self {
@@ -2215,14 +2924,6 @@ impl DenyRunDescriptor {
     } else {
       DenyRunDescriptor::Name(text.to_string())
     }
-  }
-}
-
-fn is_path(text: &str) -> bool {
-  if cfg!(windows) {
-    text.contains('/') || text.contains('\\') || Path::new(text).is_absolute()
-  } else {
-    text.contains('/')
   }
 }
 
@@ -2251,6 +2952,25 @@ pub struct SpecialFilePathQueryDescriptor<'a> {
 }
 
 impl<'a> SpecialFilePathQueryDescriptor<'a> {
+  /// Construct from a `PathQueryDescriptor` without resolving symlinks.
+  ///
+  /// Used by no-follow access modes (lstat, readlink, readdir, etc.) where
+  /// canonicalizing would change semantics by resolving the final path
+  /// component. The /proc, /dev, /sys prefix guard in `check_special_file`
+  /// still applies — it just uses the un-resolved path.
+  pub fn from_path_query_no_canonicalize(
+    path: PathQueryDescriptor<'a>,
+  ) -> Self {
+    let PathQueryDescriptor {
+      path, requested, ..
+    } = path;
+    Self {
+      path,
+      requested,
+      canonicalized: false,
+    }
+  }
+
   pub fn parse(
     sys: &impl sys_traits::FsCanonicalize,
     path: PathQueryDescriptor<'a>,
@@ -2258,6 +2978,7 @@ impl<'a> SpecialFilePathQueryDescriptor<'a> {
     let PathQueryDescriptor {
       is_windows_device_path,
       path,
+      cmp_path: _,
       requested,
     } = path;
     // On Linux, /proc may contain magic links that we don't want to resolve
@@ -2298,7 +3019,7 @@ pub enum SysDescriptorParseError {
   Empty, // Error
 }
 
-#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Clone, Eq, PartialEq, Hash, Debug, PartialOrd, Ord)]
 pub struct SysDescriptor(String);
 
 impl SysDescriptor {
@@ -2307,7 +3028,8 @@ impl SysDescriptor {
       "hostname" | "inspector" | "osRelease" | "osUptime" | "loadavg"
       | "networkInterfaces" | "systemMemoryInfo" | "uid" | "gid" | "cpus"
       | "homedir" | "getegid" | "statfs" | "getPriority" | "setPriority"
-      | "userInfo" => Ok(Self(kind)),
+      | "userInfo" | "setegid" | "seteuid" | "setgid" | "setuid" | "ca"
+      | "umask" => Ok(Self(kind)),
 
       // the underlying permission check changed to `userInfo` to better match the API,
       // alias this to avoid breaking existing projects with `--allow-sys=username`
@@ -2329,7 +3051,7 @@ impl QueryDescriptor for SysDescriptor {
     "sys"
   }
 
-  fn display_name(&self) -> Cow<str> {
+  fn display_name(&self) -> Cow<'_, str> {
     Cow::from(self.0.to_string())
   }
 
@@ -2347,10 +3069,14 @@ impl QueryDescriptor for SysDescriptor {
 
   fn check_in_permission(
     &self,
-    perm: &mut UnaryPermission<Self::AllowDesc, Self::DenyDesc>,
+    perm: &mut UnaryPermission<Self::AllowDesc>,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(perm);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      perm,
+      Self::flag_name(),
+      ()
+    );
     perm.check_desc(Some(self), false, api_name)
   }
 
@@ -2378,9 +3104,21 @@ impl QueryDescriptor for SysDescriptor {
 impl AllowDescriptor for SysDescriptor {
   type QueryDesc<'a> = SysDescriptor;
   type DenyDesc = SysDescriptor;
+
+  fn cmp_allow(&self, other: &Self) -> Ordering {
+    self.cmp(other)
+  }
+
+  fn cmp_deny(&self, _other: &Self::DenyDesc) -> Ordering {
+    Ordering::Greater
+  }
 }
 
-impl DenyDescriptor for SysDescriptor {}
+impl DenyDescriptor for SysDescriptor {
+  fn cmp_deny(&self, other: &Self) -> Ordering {
+    self.cmp(other)
+  }
+}
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct FfiQueryDescriptor<'a>(pub PathQueryDescriptor<'a>);
@@ -2393,7 +3131,7 @@ impl QueryDescriptor for FfiQueryDescriptor<'_> {
     "ffi"
   }
 
-  fn display_name(&self) -> Cow<str> {
+  fn display_name(&self) -> Cow<'_, str> {
     self.0.display_name()
   }
 
@@ -2411,10 +3149,14 @@ impl QueryDescriptor for FfiQueryDescriptor<'_> {
 
   fn check_in_permission(
     &self,
-    perm: &mut UnaryPermission<Self::AllowDesc, Self::DenyDesc>,
+    perm: &mut UnaryPermission<Self::AllowDesc>,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(perm);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      perm,
+      Self::flag_name(),
+      ()
+    );
     perm.check_desc(Some(self), true, api_name)
   }
 
@@ -2445,11 +3187,23 @@ pub struct FfiDescriptor(pub PathDescriptor);
 impl AllowDescriptor for FfiDescriptor {
   type QueryDesc<'a> = FfiQueryDescriptor<'a>;
   type DenyDesc = FfiDescriptor;
+
+  fn cmp_allow(&self, other: &Self) -> Ordering {
+    self.0.cmp_allow_allow(&other.0)
+  }
+
+  fn cmp_deny(&self, other: &Self::DenyDesc) -> Ordering {
+    self.0.cmp_allow_deny(&other.0)
+  }
 }
 
-impl DenyDescriptor for FfiDescriptor {}
+impl DenyDescriptor for FfiDescriptor {
+  fn cmp_deny(&self, other: &Self) -> Ordering {
+    self.0.cmp_deny_deny(&other.0)
+  }
+}
 
-impl UnaryPermission<ReadDescriptor, ReadDescriptor> {
+impl UnaryPermission<ReadDescriptor> {
   pub fn query(&self, desc: Option<&ReadQueryDescriptor>) -> PermissionState {
     self.query_desc(desc, AllowPartial::TreatAsPartialGranted)
   }
@@ -2473,7 +3227,11 @@ impl UnaryPermission<ReadDescriptor, ReadDescriptor> {
     desc: &ReadQueryDescriptor,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      ReadQueryDescriptor::flag_name(),
+      desc.display_name()
+    );
     self.check_desc(Some(desc), true, api_name)
   }
 
@@ -2483,7 +3241,11 @@ impl UnaryPermission<ReadDescriptor, ReadDescriptor> {
     desc: &ReadQueryDescriptor,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      ReadQueryDescriptor::flag_name(),
+      desc.display_name()
+    );
     self.check_desc(Some(desc), false, api_name)
   }
 
@@ -2491,12 +3253,16 @@ impl UnaryPermission<ReadDescriptor, ReadDescriptor> {
     &mut self,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      ReadQueryDescriptor::flag_name(),
+      ()
+    );
     self.check_desc(None, false, api_name)
   }
 }
 
-impl UnaryPermission<WriteDescriptor, WriteDescriptor> {
+impl UnaryPermission<WriteDescriptor> {
   pub fn query(&self, path: Option<&WriteQueryDescriptor>) -> PermissionState {
     self.query_desc(path, AllowPartial::TreatAsPartialGranted)
   }
@@ -2520,7 +3286,11 @@ impl UnaryPermission<WriteDescriptor, WriteDescriptor> {
     path: &WriteQueryDescriptor,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      WriteQueryDescriptor::flag_name(),
+      path.display_name()
+    );
     self.check_desc(Some(path), true, api_name)
   }
 
@@ -2530,7 +3300,11 @@ impl UnaryPermission<WriteDescriptor, WriteDescriptor> {
     path: &WriteQueryDescriptor,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      WriteQueryDescriptor::flag_name(),
+      path.display_name()
+    );
     self.check_desc(Some(path), false, api_name)
   }
 
@@ -2538,12 +3312,16 @@ impl UnaryPermission<WriteDescriptor, WriteDescriptor> {
     &mut self,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      WriteQueryDescriptor::flag_name(),
+      ()
+    );
     self.check_desc(None, false, api_name)
   }
 }
 
-impl UnaryPermission<NetDescriptor, NetDescriptor> {
+impl UnaryPermission<NetDescriptor> {
   pub fn query(&self, host: Option<&NetDescriptor>) -> PermissionState {
     self.query_desc(host, AllowPartial::TreatAsPartialGranted)
   }
@@ -2561,17 +3339,81 @@ impl UnaryPermission<NetDescriptor, NetDescriptor> {
     host: &NetDescriptor,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      NetDescriptor::flag_name(),
+      host.display_name()
+    );
     self.check_desc(Some(host), false, api_name)
   }
 
   pub fn check_all(&mut self) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      NetDescriptor::flag_name(),
+      ()
+    );
     self.check_desc(None, false, None)
+  }
+
+  /// Check if a resolved IP address is explicitly denied.
+  ///
+  /// This is used after DNS resolution to ensure that deny rules written as
+  /// IP literals (e.g. `--deny-net=127.0.0.1`) also block connections made
+  /// via hostname aliases that resolve to the denied IP (e.g. numeric forms
+  /// like `2130706433` which the OS resolver maps to `127.0.0.1`).
+  ///
+  /// Only checks deny rules — the allow check has already been performed
+  /// against the original hostname.
+  pub fn check_resolved_ip_deny(
+    &mut self,
+    desc: &NetDescriptor,
+  ) -> Result<(), PermissionDeniedError> {
+    check_deny_only(self, desc)
   }
 }
 
-impl UnaryPermission<ImportDescriptor, ImportDescriptor> {
+/// Checks a descriptor against the deny rules of a permission, ignoring
+/// everything that would grant it.
+///
+/// Used by the post-DNS-resolution checks, where the allow side has already
+/// been decided by an earlier check against the hostname the user wrote and
+/// only the deny rules still have something to say about the address that
+/// hostname turned out to point at.
+fn check_deny_only<TAllow, TQuery>(
+  perm: &UnaryPermission<TAllow>,
+  desc: &TQuery,
+) -> Result<(), PermissionDeniedError>
+where
+  TAllow: AllowDescriptor,
+  TQuery: QueryDescriptor<AllowDesc = TAllow, DenyDesc = TAllow::DenyDesc>,
+{
+  let info = format_display_name(desc.display_name()).into_owned();
+  let denied = || {
+    PermissionState::permission_denied_error(
+      TQuery::flag_name(),
+      Some(info.as_str()),
+      PermissionState::Denied,
+    )
+  };
+  if perm.flag_denied_global {
+    return Err(denied());
+  }
+  for item in perm.descriptors.iter() {
+    match item {
+      UnaryPermissionDesc::FlagDenied(v)
+      | UnaryPermissionDesc::FlagIgnored(v)
+        if desc.matches_deny(v) =>
+      {
+        return Err(denied());
+      }
+      _ => {}
+    }
+  }
+  Ok(())
+}
+
+impl UnaryPermission<ImportDescriptor> {
   pub fn query(&self, host: Option<&ImportDescriptor>) -> PermissionState {
     self.query_desc(host, AllowPartial::TreatAsPartialGranted)
   }
@@ -2592,17 +3434,64 @@ impl UnaryPermission<ImportDescriptor, ImportDescriptor> {
     host: &ImportDescriptor,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      ImportDescriptor::flag_name(),
+      host.display_name()
+    );
     self.check_desc(Some(host), false, api_name)
   }
 
   pub fn check_all(&mut self) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      ImportDescriptor::flag_name(),
+      ()
+    );
     self.check_desc(None, false, None)
+  }
+
+  /// Check if a resolved IP address is explicitly denied.
+  ///
+  /// The `--deny-import` check runs against the specifier's hostname before
+  /// any DNS lookup, so a name that resolves to a denied IP (a wildcard DNS
+  /// alias like `127.0.0.1.nip.io`, or simply an attacker-controlled record
+  /// pointing at loopback) passes it. Re-checking the address the connection
+  /// actually goes to closes that gap, mirroring
+  /// `UnaryPermission<NetDescriptor>::check_resolved_ip_deny`.
+  ///
+  /// Only checks deny rules — the allow check has already been performed
+  /// against the original hostname.
+  pub fn check_resolved_ip_deny(
+    &mut self,
+    desc: &ImportDescriptor,
+  ) -> Result<(), PermissionDeniedError> {
+    check_deny_only(self, desc)
+  }
+
+  /// Whether any deny rule is written as an IP address or subnet.
+  ///
+  /// Resolving a hostname to compare it against the deny list is only ever
+  /// useful when such a rule exists, and resolving costs a DNS lookup on a
+  /// path that otherwise touches the network zero times (a cached module), so
+  /// callers use this to skip the lookup entirely for the common case of no
+  /// address-based deny rules.
+  pub fn has_ip_deny_rules(&self) -> bool {
+    self.descriptors.iter().any(|item| match item {
+      UnaryPermissionDesc::FlagDenied(ImportDescriptor(NetDescriptor(
+        host,
+        _,
+      )))
+      | UnaryPermissionDesc::FlagIgnored(ImportDescriptor(NetDescriptor(
+        host,
+        _,
+      ))) => matches!(host, Host::Ip(_) | Host::IpSubnet(_)),
+      _ => false,
+    })
   }
 }
 
-impl UnaryPermission<EnvDescriptor, EnvDescriptor> {
+impl UnaryPermission<EnvDescriptor> {
   pub fn query(&self, env: Option<&str>) -> PermissionState {
     self.query_desc(
       env
@@ -2633,7 +3522,11 @@ impl UnaryPermission<EnvDescriptor, EnvDescriptor> {
     env: &str,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      EnvQueryDescriptor::flag_name(),
+      env
+    );
     self.check_desc(
       Some(&EnvQueryDescriptor::new(Cow::Borrowed(env))),
       false,
@@ -2642,12 +3535,16 @@ impl UnaryPermission<EnvDescriptor, EnvDescriptor> {
   }
 
   pub fn check_all(&mut self) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      EnvQueryDescriptor::flag_name(),
+      ()
+    );
     self.check_desc(None, true, None)
   }
 }
 
-impl UnaryPermission<SysDescriptor, SysDescriptor> {
+impl UnaryPermission<SysDescriptor> {
   pub fn query(&self, kind: Option<&SysDescriptor>) -> PermissionState {
     self.query_desc(kind, AllowPartial::TreatAsPartialGranted)
   }
@@ -2665,17 +3562,25 @@ impl UnaryPermission<SysDescriptor, SysDescriptor> {
     kind: &SysDescriptor,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      SysDescriptor::flag_name(),
+      kind.display_name()
+    );
     self.check_desc(Some(kind), false, api_name)
   }
 
   pub fn check_all(&mut self) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      SysDescriptor::flag_name(),
+      ()
+    );
     self.check_desc(None, false, None)
   }
 }
 
-impl UnaryPermission<AllowRunDescriptor, DenyRunDescriptor> {
+impl UnaryPermission<AllowRunDescriptor> {
   pub fn query(&self, cmd: Option<&RunQueryDescriptor>) -> PermissionState {
     self.query_desc(cmd, AllowPartial::TreatAsPartialGranted)
   }
@@ -2719,13 +3624,14 @@ impl UnaryPermission<AllowRunDescriptor, DenyRunDescriptor> {
         RunQueryDescriptor::flag_name(),
         api_name,
         || None,
+        || None,
         /* prompt */ false,
       );
     result.is_ok()
   }
 }
 
-impl UnaryPermission<FfiDescriptor, FfiDescriptor> {
+impl UnaryPermission<FfiDescriptor> {
   pub fn query(&self, path: Option<&FfiQueryDescriptor>) -> PermissionState {
     self.query_desc(path, AllowPartial::TreatAsPartialGranted)
   }
@@ -2749,7 +3655,11 @@ impl UnaryPermission<FfiDescriptor, FfiDescriptor> {
     path: &FfiQueryDescriptor,
     api_name: Option<&str>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      FfiQueryDescriptor::flag_name(),
+      path.display_name()
+    );
     self.check_desc(Some(path), true, api_name)
   }
 
@@ -2757,40 +3667,73 @@ impl UnaryPermission<FfiDescriptor, FfiDescriptor> {
     &mut self,
     path: Option<&FfiQueryDescriptor>,
   ) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      FfiQueryDescriptor::flag_name(),
+      path.as_ref().map(|path| path.display_name())
+    );
     self.check_desc(path, false, None)
   }
 
   pub fn check_all(&mut self) -> Result<(), PermissionDeniedError> {
-    skip_check_if_is_permission_fully_granted!(self);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      self,
+      FfiQueryDescriptor::flag_name(),
+      ()
+    );
     self.check_desc(None, false, Some("all"))
   }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Permissions {
-  pub read: UnaryPermission<ReadDescriptor, ReadDescriptor>,
-  pub write: UnaryPermission<WriteDescriptor, WriteDescriptor>,
-  pub net: UnaryPermission<NetDescriptor, NetDescriptor>,
-  pub env: UnaryPermission<EnvDescriptor, EnvDescriptor>,
-  pub sys: UnaryPermission<SysDescriptor, SysDescriptor>,
-  pub run: UnaryPermission<AllowRunDescriptor, DenyRunDescriptor>,
-  pub ffi: UnaryPermission<FfiDescriptor, FfiDescriptor>,
-  pub import: UnaryPermission<ImportDescriptor, ImportDescriptor>,
-  pub all: UnitPermission,
+  // WARNING: update the methods below if ever adding anything here
+  pub read: UnaryPermission<ReadDescriptor>,
+  pub write: UnaryPermission<WriteDescriptor>,
+  pub net: UnaryPermission<NetDescriptor>,
+  pub env: UnaryPermission<EnvDescriptor>,
+  pub sys: UnaryPermission<SysDescriptor>,
+  pub run: UnaryPermission<AllowRunDescriptor>,
+  pub ffi: UnaryPermission<FfiDescriptor>,
+  pub import: UnaryPermission<ImportDescriptor>,
+}
+
+impl Permissions {
+  pub fn all_granted(&self) -> bool {
+    self.read.is_allow_all()
+      && self.write.is_allow_all()
+      && self.net.is_allow_all()
+      && self.env.is_allow_all()
+      && self.sys.is_allow_all()
+      && self.run.is_allow_all()
+      && self.ffi.is_allow_all()
+      && self.import.is_allow_all()
+  }
+
+  fn disable_prompting(&mut self) {
+    self.read.prompt = false;
+    self.write.prompt = false;
+    self.net.prompt = false;
+    self.env.prompt = false;
+    self.sys.prompt = false;
+    self.run.prompt = false;
+    self.ffi.prompt = false;
+    self.import.prompt = false;
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default, Serialize, Deserialize)]
 pub struct PermissionsOptions {
-  pub allow_all: bool,
   pub allow_env: Option<Vec<String>>,
   pub deny_env: Option<Vec<String>>,
+  pub ignore_env: Option<Vec<String>>,
   pub allow_net: Option<Vec<String>>,
   pub deny_net: Option<Vec<String>>,
   pub allow_ffi: Option<Vec<String>>,
   pub deny_ffi: Option<Vec<String>>,
   pub allow_read: Option<Vec<String>>,
   pub deny_read: Option<Vec<String>>,
+  pub ignore_read: Option<Vec<String>>,
   pub allow_run: Option<Vec<String>>,
   pub deny_run: Option<Vec<String>>,
   pub allow_sys: Option<Vec<String>>,
@@ -2819,19 +3762,45 @@ pub enum PermissionsFromOptionsError {
 }
 
 impl Permissions {
-  pub fn new_unary<TAllow: AllowDescriptor, TDeny: DenyDescriptor>(
-    allow_list: Option<HashSet<TAllow>>,
-    deny_list: Option<HashSet<TDeny>>,
+  pub fn new_unary_with_ignore<TAllow: AllowDescriptor>(
+    allow_list: Option<Vec<TAllow>>,
+    deny_list: Option<Vec<TAllow::DenyDesc>>,
+    ignore_list: Option<Vec<TAllow::DenyDesc>>,
     prompt: bool,
-  ) -> UnaryPermission<TAllow, TDeny> {
-    UnaryPermission::<TAllow, TDeny> {
-      granted_global: global_from_option(allow_list.as_ref()),
-      granted_list: allow_list.unwrap_or_default(),
-      flag_denied_global: global_from_option(deny_list.as_ref()),
-      flag_denied_list: deny_list.unwrap_or_default(),
+  ) -> UnaryPermission<TAllow> {
+    let mut descriptors = UnaryPermissionDescriptors::with_capacity(
+      allow_list.as_ref().map(|v| v.len()).unwrap_or(0)
+        + ignore_list.as_ref().map(|v| v.len()).unwrap_or(0)
+        + deny_list.as_ref().map(|v| v.len()).unwrap_or(0),
+    );
+    let granted_global = global_from_option(allow_list.as_ref());
+    let flag_denied_global = global_from_option(deny_list.as_ref());
+    let flag_ignored_global = global_from_option(ignore_list.as_ref());
+    for item in allow_list.unwrap_or_default() {
+      descriptors.insert(UnaryPermissionDesc::Granted(item));
+    }
+    for item in deny_list.unwrap_or_default() {
+      descriptors.insert(UnaryPermissionDesc::FlagDenied(item));
+    }
+    for item in ignore_list.unwrap_or_default() {
+      descriptors.insert(UnaryPermissionDesc::FlagIgnored(item));
+    }
+    UnaryPermission::<TAllow> {
+      granted_global,
+      flag_denied_global,
+      flag_ignored_global,
+      descriptors,
       prompt,
       ..Default::default()
     }
+  }
+
+  pub fn new_unary<TAllow: AllowDescriptor>(
+    allow_list: Option<Vec<TAllow>>,
+    deny_list: Option<Vec<TAllow::DenyDesc>>,
+    prompt: bool,
+  ) -> UnaryPermission<TAllow> {
+    Self::new_unary_with_ignore(allow_list, deny_list, None, prompt)
   }
 
   pub const fn new_all(allow_state: bool) -> UnitPermission {
@@ -2851,15 +3820,15 @@ impl Permissions {
     fn resolve_allow_run(
       parser: &dyn PermissionDescriptorParser,
       allow_run: &[String],
-    ) -> Result<HashSet<AllowRunDescriptor>, PermissionsFromOptionsError> {
-      let mut new_allow_run = HashSet::with_capacity(allow_run.len());
+    ) -> Result<Vec<AllowRunDescriptor>, PermissionsFromOptionsError> {
+      let mut new_allow_run = Vec::with_capacity(allow_run.len());
       for unresolved in allow_run {
         if unresolved.is_empty() {
           return Err(PermissionsFromOptionsError::RunEmptyCommandName);
         }
         match parser.parse_allow_run_descriptor(unresolved)? {
           AllowRunDescriptorParseResult::Descriptor(descriptor) => {
-            new_allow_run.insert(descriptor);
+            new_allow_run.push(descriptor);
           }
           AllowRunDescriptorParseResult::Unresolved(err) => {
             log::info!(
@@ -2877,7 +3846,7 @@ impl Permissions {
     fn parse_maybe_vec<T: Eq + PartialEq + Hash, E>(
       items: Option<&[String]>,
       parse: impl Fn(&str) -> Result<T, E>,
-    ) -> Result<Option<HashSet<T>>, PermissionsFromOptionsError>
+    ) -> Result<Option<Vec<T>>, PermissionsFromOptionsError>
     where
       PermissionsFromOptionsError: From<E>,
     {
@@ -2886,7 +3855,7 @@ impl Permissions {
           items
             .iter()
             .map(|item| parse(item))
-            .collect::<Result<HashSet<_>, _>>()?,
+            .collect::<Result<Vec<_>, _>>()?,
         )),
         None => Ok(None),
       }
@@ -2912,24 +3881,27 @@ impl Permissions {
       })
       .transpose()?;
     // add the allow_run list to deny_write
-    if let Some(allow_run_vec) = &allow_run {
-      if !allow_run_vec.is_empty() {
-        let deny_write = deny_write.get_or_insert_with(Default::default);
-        deny_write.extend(
-          allow_run_vec
-            .iter()
-            .map(|item| WriteDescriptor(item.0.clone())),
-        );
-      }
+    if let Some(allow_run_vec) = &allow_run
+      && !allow_run_vec.is_empty()
+    {
+      let deny_write = deny_write.get_or_insert_with(Default::default);
+      deny_write.extend(
+        allow_run_vec
+          .iter()
+          .map(|item| WriteDescriptor(item.0.clone())),
+      );
     }
 
     Ok(Self {
-      read: Permissions::new_unary(
+      read: Permissions::new_unary_with_ignore(
         parse_maybe_vec(opts.allow_read.as_deref(), |item| {
           parser.parse_read_descriptor(item)
         })?,
         parse_maybe_vec(opts.deny_read.as_deref(), |item| {
           parser.parse_read_descriptor(item)
+        })?,
+        parse_maybe_vec(opts.ignore_read.as_deref(), |text| {
+          parser.parse_read_descriptor(text)
         })?,
         opts.prompt,
       ),
@@ -2949,11 +3921,14 @@ impl Permissions {
         })?,
         opts.prompt,
       ),
-      env: Permissions::new_unary(
+      env: Permissions::new_unary_with_ignore(
         parse_maybe_vec(opts.allow_env.as_deref(), |item| {
           parser.parse_env_descriptor(item)
         })?,
         parse_maybe_vec(opts.deny_env.as_deref(), |text| {
+          parser.parse_env_descriptor(text)
+        })?,
+        parse_maybe_vec(opts.ignore_env.as_deref(), |text| {
           parser.parse_env_descriptor(text)
         })?,
         opts.prompt,
@@ -2992,7 +3967,6 @@ impl Permissions {
         })?,
         opts.prompt,
       ),
-      all: Permissions::new_all(opts.allow_all),
     })
   }
 
@@ -3007,7 +3981,6 @@ impl Permissions {
       run: UnaryPermission::allow_all(),
       ffi: UnaryPermission::allow_all(),
       import: UnaryPermission::allow_all(),
-      all: Permissions::new_all(true),
     }
   }
 
@@ -3031,7 +4004,6 @@ impl Permissions {
       run: Permissions::new_unary(None, None, prompt),
       ffi: Permissions::new_unary(None, None, prompt),
       import: Permissions::new_unary(None, None, prompt),
-      all: Permissions::new_all(false),
     }
   }
 }
@@ -3084,6 +4056,37 @@ pub enum PermissionCheckError {
   #[class(uri)]
   #[error(transparent)]
   HostParse(#[from] HostParseError),
+  #[class(inherit)]
+  #[error(transparent)]
+  Io(std::io::Error),
+}
+
+fn ignored_to_not_found(err: PermissionDeniedError) -> PermissionCheckError {
+  #[cfg(target_arch = "wasm32")]
+  fn not_found() -> std::io::Error {
+    std::io::Error::new(
+      std::io::ErrorKind::NotFound,
+      "No such file or directory (os error 2)",
+    )
+  }
+
+  #[cfg(all(not(windows), not(target_arch = "wasm32")))]
+  fn not_found() -> std::io::Error {
+    std::io::Error::from_raw_os_error(libc::ENOENT)
+  }
+
+  #[cfg(windows)]
+  fn not_found() -> std::io::Error {
+    std::io::Error::from_raw_os_error(
+      windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32,
+    )
+  }
+
+  if err.state == PermissionState::Ignored {
+    PermissionCheckError::Io(not_found())
+  } else {
+    PermissionCheckError::PermissionDenied(err)
+  }
 }
 
 impl PermissionCheckError {
@@ -3097,6 +4100,7 @@ impl PermissionCheckError {
         std::io::ErrorKind::Other
       }
       PermissionCheckError::PathResolve(e) => e.kind(),
+      PermissionCheckError::Io(e) => e.kind(),
     }
   }
 
@@ -3110,9 +4114,13 @@ impl PermissionCheckError {
         std::io::Error::new(self.kind(), format!("{}", self))
       }
       Self::PathResolve(e) => e.into_io_error(),
+      Self::Io(e) => e,
     }
   }
 }
+
+/// Addresses a host resolved to, keyed by the host and port asked about.
+type ResolvedHostsCache = Arc<Mutex<HashMap<(String, u16), Vec<IpAddr>>>>;
 
 /// Wrapper struct for `Permissions` that can be shared across threads.
 ///
@@ -3124,6 +4132,9 @@ impl PermissionCheckError {
 pub struct PermissionsContainer {
   descriptor_parser: Arc<dyn PermissionDescriptorParser>,
   inner: Arc<Mutex<Permissions>>,
+  /// Hosts already resolved for the import deny check. See
+  /// [`PermissionsContainer::resolve_host`].
+  resolved_import_hosts: ResolvedHostsCache,
 }
 
 impl PermissionsContainer {
@@ -3134,6 +4145,7 @@ impl PermissionsContainer {
     Self {
       descriptor_parser,
       inner: Arc::new(Mutex::new(perms)),
+      resolved_import_hosts: Default::default(),
     }
   }
 
@@ -3141,6 +4153,22 @@ impl PermissionsContainer {
     Self {
       descriptor_parser: self.descriptor_parser.clone(),
       inner: Arc::new(Mutex::new(self.inner.lock().clone())),
+      resolved_import_hosts: Default::default(),
+    }
+  }
+
+  /// Creates an independent snapshot with user prompting disabled.
+  ///
+  /// Existing grants and denials are preserved, but the snapshot does not
+  /// observe later permission changes. Permission brokers are still consulted
+  /// when the snapshot is checked.
+  pub fn deep_clone_without_prompt(&self) -> PermissionsContainer {
+    let mut permissions = self.inner.lock().clone();
+    permissions.disable_prompting();
+    Self {
+      descriptor_parser: self.descriptor_parser.clone(),
+      inner: Arc::new(Mutex::new(permissions)),
+      resolved_import_hosts: Default::default(),
     }
   }
 
@@ -3154,40 +4182,9 @@ impl PermissionsContainer {
     &self,
     child_permissions_arg: ChildPermissionsArg,
   ) -> Result<PermissionsContainer, ChildPermissionError> {
-    fn is_granted_unary(arg: &ChildUnaryPermissionArg) -> bool {
-      match arg {
-        ChildUnaryPermissionArg::Inherit | ChildUnaryPermissionArg::Granted => {
-          true
-        }
-        ChildUnaryPermissionArg::NotGranted
-        | ChildUnaryPermissionArg::GrantedList(_) => false,
-      }
-    }
-
     let mut worker_perms = Permissions::none_without_prompt();
 
     let mut inner = self.inner.lock();
-    worker_perms.all = inner
-      .all
-      .create_child_permissions(ChildUnitPermissionArg::Inherit)?;
-
-    // downgrade the `worker_perms.all` based on the other values
-    if worker_perms.all.query() == PermissionState::Granted {
-      let unary_perms = [
-        &child_permissions_arg.read,
-        &child_permissions_arg.write,
-        &child_permissions_arg.net,
-        &child_permissions_arg.import,
-        &child_permissions_arg.env,
-        &child_permissions_arg.sys,
-        &child_permissions_arg.run,
-        &child_permissions_arg.ffi,
-      ];
-      let allow_all = unary_perms.into_iter().all(is_granted_unary);
-      if !allow_all {
-        worker_perms.all.revoke();
-      }
-    }
 
     // WARNING: When adding a permission here, ensure it is handled
     // in the worker_perms.all block above
@@ -3272,7 +4269,14 @@ impl PermissionsContainer {
     let mut inner = self.inner.lock();
     match specifier.scheme() {
       "file" => {
-        if inner.read.is_allow_all() || kind == CheckSpecifierKind::Static {
+        if inner.read.is_allow_all() {
+          if kind != CheckSpecifierKind::Static {
+            write_audit(ReadQueryDescriptor::flag_name(), specifier);
+          }
+
+          return Ok(());
+        }
+        if kind == CheckSpecifierKind::Static {
           return Ok(());
         }
 
@@ -3285,7 +4289,7 @@ impl PermissionsContainer {
                 .into_read(),
               Some("import()"),
             )
-            .map_err(PermissionCheckError::PermissionDenied),
+            .map_err(ignored_to_not_found),
           Err(_) => {
             Err(PermissionCheckError::InvalidFilePath(specifier.clone()))
           }
@@ -3295,6 +4299,8 @@ impl PermissionsContainer {
       "blob" => Ok(()),
       _ => {
         if inner.import.is_allow_all() {
+          write_audit(ImportDescriptor::flag_name(), specifier);
+
           return Ok(()); // avoid allocation below
         }
 
@@ -3302,7 +4308,8 @@ impl PermissionsContainer {
           .descriptor_parser
           .parse_import_descriptor_from_url(specifier)?;
         inner.import.check(&desc, Some("import()"))?;
-        Ok(())
+        drop(inner); // the resolved check takes the lock itself, around a DNS lookup
+        self.check_import_resolved_host(specifier)
       }
     }
   }
@@ -3340,10 +4347,11 @@ impl PermissionsContainer {
     blind_requested: Option<&str>,
     api_name: Option<&str>,
   ) -> Result<CheckedPath<'a>, PermissionCheckError> {
-    // If somehow read or write aren't specified, use read
     let path = {
       let mut inner = self.inner.lock();
-      if matches!(inner.all.state, PermissionState::Granted) {
+      if inner.all_granted() {
+        write_audit(ReadQueryDescriptor::flag_name(), &path);
+        write_audit(WriteQueryDescriptor::flag_name(), &path);
         return Ok(CheckedPath {
           path: PathWithRequested {
             path,
@@ -3356,27 +4364,40 @@ impl PermissionsContainer {
         access_kind.is_read() && !inner.read.is_allow_all();
       let should_check_write =
         access_kind.is_write() && !inner.write.is_allow_all();
-      let path = self.descriptor_parser.parse_path_query(path)?;
-      let path = match blind_requested {
-        Some(display) => path.with_requested(format!("<{}>", display)),
-        None => path,
+      let path_descriptor =
+        self.descriptor_parser.parse_path_query(path.clone())?;
+      let path_descriptor = match blind_requested {
+        Some(display) => {
+          path_descriptor.with_requested(format!("<{}>", display))
+        }
+        None => path_descriptor,
       };
       if !should_check_read && !should_check_write {
+        write_audit(ReadQueryDescriptor::flag_name(), &path);
+        write_audit(WriteQueryDescriptor::flag_name(), &path);
         drop(inner);
-        path
+        path_descriptor
       } else {
+        // Use partial-deny semantics here: the operations gated by
+        // `check_open` (open, stat, lstat, readDir, readFile, writeFile, …)
+        // act on a single path and do not recurse, so a deny scope that lies
+        // *under* the queried path should not block the operation. The strict
+        // `check` (which fails on partial denies inside the requested scope)
+        // remains in use for recursive operations like `fs::remove_all`.
         let path = if should_check_read {
           let inner = &mut inner.read;
-          let desc = path.into_read();
-          inner.check(&desc, api_name)?;
+          let desc = path_descriptor.into_read();
+          inner
+            .check_partial(&desc, api_name)
+            .map_err(ignored_to_not_found)?;
           desc.0
         } else {
-          path
+          path_descriptor
         };
         if should_check_write {
           let inner = &mut inner.write;
           let desc = path.into_write();
-          inner.check(&desc, api_name)?;
+          inner.check_partial(&desc, api_name)?;
           desc.0
         } else {
           path
@@ -3384,18 +4405,16 @@ impl PermissionsContainer {
       }
     };
 
-    if access_kind.is_no_follow() {
-      Ok(CheckedPath {
-        path: PathWithRequested {
-          path: path.path,
-          requested: path.requested.map(Cow::Owned),
-        },
-        canonicalized: false,
-      })
+    let special_path = if access_kind.is_no_follow() {
+      // Don't canonicalize: lstat/readlink/readdir need to operate on the
+      // un-resolved path. The /proc, /dev, /sys prefix guard inside
+      // `check_special_file` still fires when the caller-supplied path is
+      // itself a kernel-magic location (e.g. `/proc/self/root/...`).
+      SpecialFilePathQueryDescriptor::from_path_query_no_canonicalize(path)
     } else {
-      let path = self.descriptor_parser.parse_special_file_descriptor(path)?;
-      self.check_special_file(path, api_name)
-    }
+      self.descriptor_parser.parse_special_file_descriptor(path)?
+    };
+    self.check_special_file(special_path, access_kind, api_name)
   }
 
   #[inline(always)]
@@ -3403,8 +4422,12 @@ impl PermissionsContainer {
     &self,
     api_name: &str,
   ) -> Result<(), PermissionCheckError> {
-    self.inner.lock().read.check_all(Some(api_name))?;
-    Ok(())
+    self
+      .inner
+      .lock()
+      .read
+      .check_all(Some(api_name))
+      .map_err(ignored_to_not_found)
   }
 
   #[inline(always)]
@@ -3430,6 +4453,7 @@ impl PermissionsContainer {
     let mut inner = self.inner.lock();
     let inner = &mut inner.write;
     if inner.is_allow_all() {
+      write_audit(WriteQueryDescriptor::flag_name(), &path);
       Ok(CheckedPath {
         path: PathWithRequested {
           path,
@@ -3443,6 +4467,43 @@ impl PermissionsContainer {
       // skip checking for special permissions because we consider
       // write_partial as WriteNoFollow because it's only used for
       // fs::remove
+      Ok(CheckedPath {
+        path: PathWithRequested {
+          path: desc.0.path,
+          requested: desc.0.requested.map(Cow::Owned),
+        },
+        canonicalized: false,
+      })
+    }
+  }
+
+  /// Strict counterpart of [`Self::check_write_partial`]: every path below the
+  /// query must be allowed. Use this for recursive write operations such as
+  /// `fs::remove_all`, where a deny scope *inside* the requested tree must still
+  /// block the operation. (`check_open` deliberately uses partial semantics, so
+  /// recursive callers must not route through it.)
+  #[inline(always)]
+  pub fn check_write<'a>(
+    &self,
+    path: Cow<'a, Path>,
+    api_name: &str,
+  ) -> Result<CheckedPath<'a>, PermissionCheckError> {
+    let mut inner = self.inner.lock();
+    let inner = &mut inner.write;
+    if inner.is_allow_all() {
+      write_audit(WriteQueryDescriptor::flag_name(), &path);
+      Ok(CheckedPath {
+        path: PathWithRequested {
+          path,
+          requested: None,
+        },
+        canonicalized: false,
+      })
+    } else {
+      let desc = self.descriptor_parser.parse_path_query(path)?.into_write();
+      inner.check(&desc, Some(api_name))?;
+      // skip checking for special permissions because this is treated as
+      // WriteNoFollow (it's only used for the recursive `fs::remove` path)
       Ok(CheckedPath {
         path: PathWithRequested {
           path: desc.0.path,
@@ -3514,17 +4575,25 @@ impl PermissionsContainer {
     Ok(())
   }
 
-  /// This checks to see if the allow-all flag was passed, not whether all
-  /// permissions are enabled!
   #[inline(always)]
-  fn check_was_allow_all_flag_passed(
+  pub fn check_has_all_permissions(
     &self,
     context_path: &Path,
   ) -> Result<(), PermissionCheckError> {
-    self.inner.lock().all.check(|| {
-      Some(format_display_name(context_path.to_string_lossy()).into_owned())
-    })?;
-    Ok(())
+    let inner = self.inner.lock();
+    if inner.all_granted() {
+      Ok(())
+    } else {
+      let display_name = format_display_name(context_path.to_string_lossy());
+      Err(
+        PermissionState::permission_denied_error(
+          "all",
+          Some(display_name.as_ref()),
+          PermissionState::Denied,
+        )
+        .into(),
+      )
+    }
   }
 
   /// Checks special file access, returning the failed permission type if
@@ -3533,15 +4602,14 @@ impl PermissionsContainer {
   pub fn check_special_file<'a>(
     &self,
     path: SpecialFilePathQueryDescriptor<'a>,
+    access_kind: OpenAccessKind,
     _api_name: Option<&str>,
   ) -> Result<CheckedPath<'a>, PermissionCheckError> {
     let requested = path.requested;
     let canonicalized = path.canonicalized;
     let path = path.path;
 
-    // Safe files with no major additional side-effects. While there's a small risk of someone
-    // draining system entropy by just reading one of these files constantly, that's not really
-    // something we worry about as they already have --allow-read to /dev.
+    // Safe files with no major additional side-effects.
     if cfg!(unix)
       && (path == OsStr::new("/dev/random")
         || path == OsStr::new("/dev/urandom")
@@ -3557,28 +4625,38 @@ impl PermissionsContainer {
       });
     }
 
+    // We allow /dev/tty access specifically for checking isatty() or reading input,
+    // but we BLOCK write access to prevent permission prompt spoofing attacks.
+    if cfg!(unix) && path == OsStr::new("/dev/tty") && !access_kind.is_write() {
+      return Ok(CheckedPath {
+        path: PathWithRequested {
+          path,
+          requested: requested.map(Cow::Owned),
+        },
+        canonicalized,
+      });
+    }
+
     /// We'll allow opening /proc/self/fd/{n} without additional permissions under the following conditions:
     ///
     /// 1. n > 2. This allows for opening bash-style redirections, but not stdio
     /// 2. the fd referred to by n is a pipe
     #[cfg(unix)]
     fn is_fd_file_is_pipe(path: &Path) -> bool {
-      if let Some(fd) = path.file_name() {
-        if let Ok(s) = std::str::from_utf8(fd.as_encoded_bytes()) {
-          if let Ok(n) = s.parse::<i32>() {
-            if n > 2 {
-              // SAFETY: This is proper use of the stat syscall
-              unsafe {
-                let mut stat = std::mem::zeroed::<libc::stat>();
-                if libc::fstat(n, &mut stat as _) == 0
-                  && ((stat.st_mode & libc::S_IFMT) & libc::S_IFIFO) != 0
-                {
-                  return true;
-                }
-              };
-            }
+      if let Some(fd) = path.file_name()
+        && let Ok(s) = std::str::from_utf8(fd.as_encoded_bytes())
+        && let Ok(n) = s.parse::<i32>()
+        && n > 2
+      {
+        // SAFETY: This is proper use of the stat syscall
+        unsafe {
+          let mut stat = std::mem::zeroed::<libc::stat>();
+          if libc::fstat(n, &mut stat as _) == 0
+            && ((stat.st_mode & libc::S_IFMT) & libc::S_IFIFO) != 0
+          {
+            return true;
           }
-        }
+        };
       }
       false
     }
@@ -3615,13 +4693,16 @@ impl PermissionsContainer {
       {
         if path.ends_with("/environ") {
           self.check_env_all()?;
+        } else if path.starts_with("/proc/pressure/") {
+          // Allow /proc/pressure/* files with just --allow-read since they are
+          // read-only system monitoring files that only expose performance metrics
         } else {
-          self.check_was_allow_all_flag_passed(&path)?;
+          self.check_has_all_permissions(&path)?;
         }
       }
     } else if cfg!(unix) {
       if path.starts_with("/dev") {
-        self.check_was_allow_all_flag_passed(&path)?;
+        self.check_has_all_permissions(&path)?;
       }
     } else if cfg!(target_os = "windows") {
       // \\.\nul is allowed
@@ -3654,7 +4735,7 @@ impl PermissionsContainer {
 
       // If this is a normalized drive path, accept it
       if !is_normalized_windows_drive_path(&path) {
-        self.check_was_allow_all_flag_passed(&path)?;
+        self.check_has_all_permissions(&path)?;
       }
     } else {
       unimplemented!()
@@ -3675,9 +4756,11 @@ impl PermissionsContainer {
     api_name: &str,
   ) -> Result<(), PermissionCheckError> {
     let mut inner = self.inner.lock();
-    if inner.net.is_allow_all() {
-      return Ok(());
-    }
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      inner.net,
+      NetDescriptor::flag_name(),
+      url
+    );
     let desc = self.descriptor_parser.parse_net_descriptor_from_url(url)?;
     inner.net.check(&desc, Some(api_name))?;
     Ok(())
@@ -3691,11 +4774,125 @@ impl PermissionsContainer {
   ) -> Result<(), PermissionCheckError> {
     let mut inner = self.inner.lock();
     let inner = &mut inner.net;
-    skip_check_if_is_permission_fully_granted!(inner);
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      inner,
+      NetDescriptor::flag_name(),
+      {
+        let hostname = Host::parse_for_query(host.0.as_ref())?;
+        let descriptor = NetDescriptor(hostname, host.1.map(Into::into));
+        descriptor.display_name().into_owned()
+      }
+    );
     let hostname = Host::parse_for_query(host.0.as_ref())?;
     let descriptor = NetDescriptor(hostname, host.1.map(Into::into));
     inner.check(&descriptor, Some(api_name))?;
     Ok(())
+  }
+
+  /// After resolving a hostname to an IP address, check that the resolved
+  /// IP is not in the deny list. This prevents bypassing IP-literal deny
+  /// rules via numeric hostname aliases or attacker-controlled DNS.
+  #[inline(always)]
+  pub fn check_net_resolved(
+    &mut self,
+    resolved_ip: &std::net::IpAddr,
+    port: u16,
+    // the denial names the resolved address rather than the API that reached
+    // it, so the API name is only here to keep call sites uniform
+    _api_name: &str,
+  ) -> Result<(), PermissionCheckError> {
+    let mut inner = self.inner.lock();
+    let desc =
+      NetDescriptor(Host::Ip(normalize_ip(*resolved_ip)), Some(port.into()));
+    inner.net.check_resolved_ip_deny(&desc)?;
+    Ok(())
+  }
+
+  /// After resolving a module specifier's hostname to an IP address, check
+  /// that the resolved IP is not in the import deny list. This prevents
+  /// bypassing IP-literal `--deny-import` rules via hostname aliases that
+  /// resolve to the denied IP.
+  #[inline(always)]
+  pub fn check_import_resolved(
+    &mut self,
+    resolved_ip: &std::net::IpAddr,
+    port: u16,
+    _api_name: &str,
+  ) -> Result<(), PermissionCheckError> {
+    let mut inner = self.inner.lock();
+    let desc = ImportDescriptor(NetDescriptor(
+      Host::Ip(*resolved_ip),
+      Some(port.into()),
+    ));
+    inner.import.check_resolved_ip_deny(&desc)?;
+    Ok(())
+  }
+
+  /// Checks the addresses a URL's hostname resolves to against the import
+  /// deny list.
+  ///
+  /// The deny check that runs on the specifier sees only the hostname the
+  /// user wrote, which says nothing about where that name points: a wildcard
+  /// DNS alias like `127.0.0.1.nip.io`, or any record aimed at a denied
+  /// address, passes it. The connector re-checks each address it is about to
+  /// connect to, but a module served from the HTTP cache opens no connection
+  /// at all, so the check has to happen here as well to decide whether the
+  /// module may be loaded rather than merely whether it may be fetched.
+  fn check_import_resolved_host(
+    &self,
+    url: &Url,
+  ) -> Result<(), PermissionCheckError> {
+    if !self.inner.lock().import.has_ip_deny_rules() {
+      return Ok(());
+    }
+    // an IP literal was already compared against the deny rules directly
+    let Some(url::Host::Domain(host)) = url.host() else {
+      return Ok(());
+    };
+    let Some(port) = url.port_or_known_default() else {
+      return Ok(());
+    };
+    // Resolve before taking the lock: `resolve_host` may block on DNS and must
+    // not hold the permissions lock while it does.
+    let ips = self.resolve_host(host, port);
+    if ips.is_empty() {
+      return Ok(());
+    }
+    let inner = self.inner.lock();
+    for ip in ips {
+      let desc =
+        ImportDescriptor(NetDescriptor(Host::Ip(ip), Some(port.into())));
+      check_deny_only(&inner.import, &desc)?;
+    }
+    Ok(())
+  }
+
+  /// Resolves a host for the deny check, memoized for the life of the
+  /// container.
+  ///
+  /// This is a blocking `getaddrinfo` on the caller's thread — deliberately, on
+  /// a path already gated by `has_ip_deny_rules` (so it never runs unless an
+  /// IP-literal `--deny-import` rule exists) and only reached from the
+  /// synchronous [`Self::check_specifier`]. The lookup it duplicates for a live
+  /// fetch is redone by the connector anyway; its unique job is the cached
+  /// path, where no connection is opened and thus no other lookup happens.
+  ///
+  /// A failed lookup yields no addresses rather than an error: nothing is
+  /// denied by a name that resolves to nothing, and the fetch this check
+  /// precedes will report the resolution failure with far better context.
+  /// Results are memoized because a graph commonly pulls dozens of modules
+  /// from one host, and because the connector — which runs its own lookup at
+  /// connect time — is what ultimately decides where a connection goes.
+  fn resolve_host(&self, host: &str, port: u16) -> Vec<std::net::IpAddr> {
+    let key = (host.to_string(), port);
+    if let Some(ips) = self.resolved_import_hosts.lock().get(&key) {
+      return ips.clone();
+    }
+    let ips = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+      .map(|addrs| addrs.map(|addr| addr.ip()).collect::<Vec<_>>())
+      .unwrap_or_default();
+    self.resolved_import_hosts.lock().insert(key, ips.clone());
+    ips
   }
 
   #[inline(always)]
@@ -3706,11 +4903,42 @@ impl PermissionsContainer {
     api_name: &str,
   ) -> Result<(), PermissionCheckError> {
     let mut inner = self.inner.lock();
-    if inner.net.is_allow_all() {
-      return Ok(());
-    }
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      inner.net,
+      NetDescriptor::flag_name(),
+      format!("{cid}:{port}")
+    );
     let desc = NetDescriptor(Host::Vsock(cid), Some(port));
     inner.net.check(&desc, Some(api_name))?;
+    Ok(())
+  }
+
+  /// Network permission check for Unix domain socket endpoints.
+  ///
+  /// `path` must already be resolved to an absolute path (typically by the
+  /// caller's earlier `check_open` pass). Matched lexically against
+  /// `--allow-net=unix:<absolute-path>` rules. Both sides are lexically
+  /// normalized (`.`/`..` components removed; rules at parse time, the query
+  /// path by `check_open`), but symlinks are deliberately not resolved,
+  /// mirroring `check_open`'s symlink-location semantics: a rule scopes the
+  /// socket *location*, not the inode it points at.
+  ///
+  /// Abstract socket paths (Linux, leading NUL) are not absolute, so they
+  /// cannot be expressed as a scoped `unix:` rule and are only reachable via
+  /// an unscoped `--allow-net` grant.
+  pub fn check_net_unix_socket(
+    &mut self,
+    path: &Path,
+    api_name: Option<&str>,
+  ) -> Result<(), PermissionCheckError> {
+    let mut inner = self.inner.lock();
+    audit_and_skip_check_if_is_permission_fully_granted!(
+      inner.net,
+      NetDescriptor::flag_name(),
+      format!("unix:{}", path.display())
+    );
+    let desc = NetDescriptor(Host::UnixSocket(path.to_path_buf()), None);
+    inner.net.check(&desc, api_name)?;
     Ok(())
   }
 
@@ -3722,6 +4950,7 @@ impl PermissionsContainer {
     let mut inner = self.inner.lock();
     let inner = &mut inner.ffi;
     if inner.is_allow_all() {
+      write_audit(FfiQueryDescriptor::flag_name(), &path);
       Ok(path)
     } else {
       let desc = self.descriptor_parser.parse_path_query(path)?.into_ffi();
@@ -3739,6 +4968,8 @@ impl PermissionsContainer {
     let inner = &mut inner.ffi;
     if !inner.is_allow_all() {
       inner.check_partial(None)?;
+    } else {
+      write_audit(FfiQueryDescriptor::flag_name(), ());
     }
     Ok(())
   }
@@ -3752,6 +4983,7 @@ impl PermissionsContainer {
     let mut inner = self.inner.lock();
     let inner = &mut inner.ffi;
     if inner.is_allow_all() {
+      write_audit(FfiQueryDescriptor::flag_name(), &path);
       Ok(path)
     } else {
       let desc = self.descriptor_parser.parse_path_query(path)?.into_ffi();
@@ -4210,10 +5442,6 @@ impl PermissionsContainer {
       ),
     )
   }
-
-  pub fn allows_all(&self) -> bool {
-    matches!(self.inner.lock().all.state, PermissionState::Granted)
-  }
 }
 
 const fn unit_permission_from_flag_bools(
@@ -4237,7 +5465,7 @@ const fn unit_permission_from_flag_bools(
   }
 }
 
-fn global_from_option<T>(flag: Option<&HashSet<T>>) -> bool {
+fn global_from_option<T>(flag: Option<&Vec<T>>) -> bool {
   matches!(flag, Some(v) if v.is_empty())
 }
 
@@ -4597,8 +5825,10 @@ mod tests {
   use fqdn::fqdn;
   use prompter::tests::*;
   use serde_json::json;
+  use sys_traits::EnvCurrentDir;
 
   use super::*;
+  use crate::prompter::set_prompter;
 
   // Creates vector of strings, Vec<String>
   macro_rules! svec {
@@ -4615,8 +5845,10 @@ mod tests {
       } else {
         PathBuf::from("/").join(path)
       };
+      let cmp_path = comparison_path(&path);
       PathDescriptor {
         path,
+        cmp_path,
         requested: None,
         is_windows_device_path: false,
       }
@@ -4697,8 +5929,10 @@ mod tests {
       &self,
       path: Cow<'a, Path>,
     ) -> Result<PathQueryDescriptor<'a>, PathResolveError> {
+      let cmp_path = comparison_path(&path);
       Ok(PathQueryDescriptor {
         path,
+        cmp_path,
         requested: None,
         is_windows_device_path: false,
       })
@@ -4729,6 +5963,73 @@ mod tests {
         canonicalized: false,
       })
     }
+  }
+
+  #[test]
+  fn deep_clone_without_prompt_preserves_state_without_prompting() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+    let permissions = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/allowed"]),
+        deny_read: Some(svec!["/denied"]),
+        prompt: true,
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let permissions = PermissionsContainer::new(Arc::new(parser), permissions);
+    let snapshot = permissions.deep_clone_without_prompt();
+
+    let prompt_value = PERMISSION_PROMPT_STUB_VALUE_SETTER.lock();
+    prompt_value.set(true);
+
+    assert!(
+      snapshot
+        .check_open(
+          Cow::Borrowed(Path::new("/unresolved")),
+          OpenAccessKind::Read,
+          None,
+        )
+        .is_err()
+    );
+    assert!(
+      snapshot
+        .check_open(
+          Cow::Borrowed(Path::new("/allowed/file")),
+          OpenAccessKind::Read,
+          None,
+        )
+        .is_ok()
+    );
+    assert!(
+      snapshot
+        .check_open(
+          Cow::Borrowed(Path::new("/denied/file")),
+          OpenAccessKind::Read,
+          None,
+        )
+        .is_err()
+    );
+
+    assert_eq!(
+      permissions.query_read(Some("/unresolved")).unwrap(),
+      PermissionState::Prompt
+    );
+    assert!(
+      permissions
+        .check_open(
+          Cow::Borrowed(Path::new("/unresolved")),
+          OpenAccessKind::Read,
+          None,
+        )
+        .is_ok()
+    );
+    assert_eq!(
+      snapshot.query_read(Some("/unresolved")).unwrap(),
+      PermissionState::Prompt
+    );
   }
 
   #[test]
@@ -4796,6 +6097,118 @@ mod tests {
         is_ok
       );
     }
+  }
+
+  #[test]
+  #[cfg(target_os = "macos")]
+  fn check_paths_macos_unicode_normalization() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+
+    // Deny a path containing ß — on APFS this is the same file as one with "ss"
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/data"]),
+        deny_read: Some(svec!["/data/file_\u{00df}.txt"]),
+        allow_write: Some(svec!["/data"]),
+        deny_write: Some(svec!["/data/file_\u{00df}.txt"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    // Access via "ss" form must also be denied (APFS treats ß and ss as same file)
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("/data/file_ss.txt")),
+          OpenAccessKind::Read,
+          Some("api")
+        )
+        .is_err(),
+      "deny-read bypass via ß/ss equivalence"
+    );
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("/data/file_ss.txt")),
+          OpenAccessKind::Write,
+          Some("api")
+        )
+        .is_err(),
+      "deny-write bypass via ß/ss equivalence"
+    );
+
+    // NFC é (U+00E9) vs NFD e + combining accent (U+0065 U+0301)
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/data"]),
+        deny_read: Some(svec!["/data/file_\u{00e9}.txt"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let perms = PermissionsContainer::new(Arc::new(parser), perms);
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("/data/file_e\u{0301}.txt")),
+          OpenAccessKind::Read,
+          Some("api")
+        )
+        .is_err(),
+      "deny-read bypass via NFC/NFD equivalence"
+    );
+
+    // Case insensitivity: APFS is case-insensitive by default
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/data"]),
+        deny_read: Some(svec!["/data/SECRET.txt"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let perms = PermissionsContainer::new(Arc::new(parser), perms);
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("/data/secret.txt")),
+          OpenAccessKind::Read,
+          Some("api")
+        )
+        .is_err(),
+      "deny-read bypass via case insensitivity"
+    );
+
+    // fi ligature (U+FB01) vs "fi" — NFKD compatibility decomposition
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/data"]),
+        deny_read: Some(svec!["/data/file_\u{fb01}.txt"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let perms = PermissionsContainer::new(Arc::new(parser), perms);
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("/data/file_fi.txt")),
+          OpenAccessKind::Read,
+          Some("api")
+        )
+        .is_err(),
+      "deny-read bypass via fi ligature equivalence"
+    );
   }
 
   #[test]
@@ -4951,6 +6364,133 @@ mod tests {
   }
 
   #[test]
+  fn test_check_net_deny_resolved_ip() {
+    // Regression test: deny rules written as IP literals must also block
+    // connections after DNS resolution, preventing bypasses via numeric
+    // hostname aliases (e.g. 2130706433 → 127.0.0.1).
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_net: Some(svec![]),
+        deny_net: Some(svec!["127.0.0.1"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    // The resolved IP 127.0.0.1 should be denied regardless of original
+    // hostname.
+    let denied_ip = std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let desc = NetDescriptor(Host::Ip(denied_ip), Some(12345));
+    assert!(
+      perms.net.check_resolved_ip_deny(&desc).is_err(),
+      "resolved 127.0.0.1 should be denied"
+    );
+
+    // A different IP should not be denied.
+    let allowed_ip = std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+    let desc = NetDescriptor(Host::Ip(allowed_ip), Some(12345));
+    assert!(
+      perms.net.check_resolved_ip_deny(&desc).is_ok(),
+      "resolved 192.168.1.1 should not be denied"
+    );
+  }
+
+  #[test]
+  fn test_check_net_resolved_ipv4_mapped_ipv6() {
+    for deny_rule in ["127.0.0.1", "127.0.0.0/8", "127.0.0.1:8080"] {
+      let parser = TestPermissionDescriptorParser;
+      let perms = Permissions::from_options(
+        &parser,
+        &PermissionsOptions {
+          allow_net: Some(svec!["example.com"]),
+          deny_net: Some(vec![deny_rule.to_string()]),
+          prompt: false,
+          ..Default::default()
+        },
+      )
+      .unwrap();
+      let mut perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+      // The hostname is allowed before DNS resolution.
+      assert!(perms.check_net(&("example.com", Some(8080)), "api").is_ok());
+      for ip in ["127.0.0.1", "::ffff:127.0.0.1"] {
+        assert!(
+          perms
+            .check_net_resolved(&ip.parse().unwrap(), 8080, "api")
+            .is_err(),
+          "resolved {ip}:8080 should be denied by {deny_rule}"
+        );
+      }
+
+      // Unrelated addresses remain allowed by the post-resolution check.
+      for ip in ["192.168.1.1", "::ffff:192.168.1.1", "::1"] {
+        assert!(
+          perms
+            .check_net_resolved(&ip.parse().unwrap(), 8080, "api")
+            .is_ok(),
+          "resolved {ip}:8080 should not be denied by {deny_rule}"
+        );
+      }
+      if deny_rule == "127.0.0.1:8080" {
+        assert!(
+          perms
+            .check_net_resolved(
+              &"::ffff:127.0.0.1".parse().unwrap(),
+              9090,
+              "api"
+            )
+            .is_ok()
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn test_check_net_deny_resolved_ip_subnet() {
+    // Regression test: subnet-based deny rules (e.g. --deny-net=127.0.0.0/8)
+    // must also block resolved IPs that fall within the subnet, preventing
+    // bypasses via numeric hostname aliases (e.g. 2130706433 → 127.0.0.1).
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_net: Some(svec![]),
+        deny_net: Some(svec!["127.0.0.0/8"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    // 127.0.0.1 falls within the 127.0.0.0/8 subnet — should be denied.
+    let denied_ip = std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let desc = NetDescriptor(Host::Ip(denied_ip), Some(8000));
+    assert!(
+      perms.net.check_resolved_ip_deny(&desc).is_err(),
+      "resolved 127.0.0.1 should be denied by 127.0.0.0/8 subnet rule"
+    );
+
+    // 127.1.2.3 also falls within 127.0.0.0/8 — should be denied.
+    let denied_ip2 = std::net::IpAddr::V4(Ipv4Addr::new(127, 1, 2, 3));
+    let desc = NetDescriptor(Host::Ip(denied_ip2), Some(9000));
+    assert!(
+      perms.net.check_resolved_ip_deny(&desc).is_err(),
+      "resolved 127.1.2.3 should be denied by 127.0.0.0/8 subnet rule"
+    );
+
+    // 192.168.1.1 is outside the subnet — should not be denied.
+    let allowed_ip = std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+    let desc = NetDescriptor(Host::Ip(allowed_ip), Some(8000));
+    assert!(
+      perms.net.check_resolved_ip_deny(&desc).is_ok(),
+      "resolved 192.168.1.1 should not be denied by 127.0.0.0/8 subnet rule"
+    );
+  }
+
+  #[test]
   fn test_check_net_url() {
     let parser = TestPermissionDescriptorParser;
     let perms = Permissions::from_options(
@@ -5102,6 +6642,41 @@ mod tests {
     }
   }
 
+  // `localhost` matches no deny rule as written, so a specifier check that
+  // stopped at the hostname would let it through — including for a module
+  // already in the cache, which never reaches the connector's own check.
+  #[test]
+  fn check_specifier_resolved_ip_deny() {
+    set_prompter(Box::new(TestPrompter));
+    let container = |deny_import: Vec<String>| {
+      let parser = TestPermissionDescriptorParser;
+      let perms = Permissions::from_options(
+        &parser,
+        &PermissionsOptions {
+          allow_import: Some(vec![]),
+          deny_import: Some(deny_import),
+          ..Default::default()
+        },
+      )
+      .unwrap();
+      PermissionsContainer::new(Arc::new(parser), perms)
+    };
+    let specifier = Url::parse("http://localhost:4545/mod.ts").unwrap();
+    let check = |perms: PermissionsContainer| {
+      perms
+        .check_specifier(&specifier, CheckSpecifierKind::Static)
+        .is_ok()
+    };
+
+    assert!(!check(container(svec!["127.0.0.1", "[::1]"])));
+    // a subnet covering the resolved address denies it just the same
+    assert!(!check(container(svec!["127.0.0.0/8", "[::1]"])));
+    // a deny rule for an address `localhost` does not resolve to
+    assert!(check(container(svec!["192.0.2.1"])));
+    // no IP-literal rule at all, so nothing is resolved
+    assert!(check(container(svec!["example.com"])));
+  }
+
   #[test]
   fn test_query() {
     set_prompter(Box::new(TestPrompter));
@@ -5117,7 +6692,6 @@ mod tests {
         allow_env: Some(svec!["HOME"]),
         allow_sys: Some(svec!["hostname"]),
         allow_run: Some(svec!["/deno"]),
-        allow_all: false,
         ..Default::default()
       },
     )
@@ -5160,11 +6734,26 @@ mod tests {
       },
     )
     .unwrap();
+    let read_query = |path: &str| {
+      parser
+        .parse_path_query(Cow::Owned(PathBuf::from(path)))
+        .unwrap()
+        .into_read()
+    };
+    let write_query = |path: &str| {
+      parser
+        .parse_path_query(Cow::Owned(PathBuf::from(path)))
+        .unwrap()
+        .into_write()
+    };
+    let ffi_query = |path: &str| {
+      parser
+        .parse_path_query(Cow::Owned(PathBuf::from(path)))
+        .unwrap()
+        .into_ffi()
+    };
     #[rustfmt::skip]
     {
-      let read_query = |path: &str| parser.parse_path_query(Cow::Owned(PathBuf::from(path))).unwrap().into_read();
-      let write_query = |path: &str| parser.parse_path_query(Cow::Owned(PathBuf::from(path))).unwrap().into_write();
-      let ffi_query = |path: &str| parser.parse_path_query(Cow::Owned(PathBuf::from(path))).unwrap().into_ffi();
       assert_eq!(perms1.read.query(None), PermissionState::Granted);
       assert_eq!(perms1.read.query(Some(&read_query("/foo"))), PermissionState::Granted);
       assert_eq!(perms2.read.query(None), PermissionState::Prompt);
@@ -5249,6 +6838,58 @@ mod tests {
       assert_eq!(perms4.import.query(None), PermissionState::GrantedPartial);
       assert_eq!(perms4.import.query(Some(&ImportDescriptor(NetDescriptor(Host::must_parse("example.com"), Some(443))))), PermissionState::Denied);
       assert_eq!(perms4.import.query(Some(&ImportDescriptor(NetDescriptor(Host::must_parse("deno.land"), Some(443))))), PermissionState::Granted);
+    };
+    #[rustfmt::skip]
+    {
+      let perms = Permissions::from_options(
+        &parser,
+        &PermissionsOptions {
+          allow_read: Some(svec!["/foo/specific"]),
+          deny_read: Some(svec!["/foo"]),
+          allow_write: Some(svec!["/foo/specific"]),
+          deny_write: Some(svec!["/foo"]),
+          allow_ffi: Some(svec!["/foo/specific"]),
+          deny_ffi: Some(svec!["/foo"]),
+          ..Default::default()
+        },
+      )
+      .unwrap();
+      assert_eq!(perms.read.query(Some(&read_query("/foo"))), PermissionState::Denied);
+      assert_eq!(perms.read.query(Some(&read_query("/"))), PermissionState::Prompt);
+      assert_eq!(perms.read.query(Some(&read_query("/foo/specific"))), PermissionState::Granted);
+      assert_eq!(perms.read.query(Some(&read_query("/foo/specific/data.txt"))), PermissionState::Granted);
+      assert_eq!(perms.write.query(Some(&write_query("/foo"))), PermissionState::Denied);
+      assert_eq!(perms.write.query(Some(&write_query("/foo/specific"))), PermissionState::Granted);
+      assert_eq!(perms.ffi.query(Some(&ffi_query("/foo"))), PermissionState::Denied);
+      assert_eq!(perms.ffi.query(Some(&ffi_query("/foo/specific"))), PermissionState::Granted);
+    };
+    #[rustfmt::skip]
+    {
+      // flipped above
+      let perms = Permissions::from_options(
+        &parser,
+        &PermissionsOptions {
+          allow_read: Some(svec!["/foo"]),
+          deny_read: Some(svec!["/foo/specific"]),
+          allow_write: Some(svec!["/foo"]),
+          deny_write: Some(svec!["/foo/specific"]),
+          allow_ffi: Some(svec!["/foo"]),
+          deny_ffi: Some(svec!["/foo/specific"]),
+          ..Default::default()
+        },
+      )
+      .unwrap();
+      assert_eq!(perms.read.query(Some(&read_query("/foo"))), PermissionState::GrantedPartial);
+      assert_eq!(perms.read.query(Some(&read_query("/foo/bar"))), PermissionState::Granted);
+      assert_eq!(perms.read.query(Some(&read_query("/"))), PermissionState::Prompt);
+      assert_eq!(perms.read.query(Some(&read_query("/foo/specific"))), PermissionState::Denied);
+      assert_eq!(perms.read.query(Some(&read_query("/foo/specific/data.txt"))), PermissionState::Denied);
+      assert_eq!(perms.write.query(Some(&write_query("/foo"))), PermissionState::GrantedPartial);
+      assert_eq!(perms.write.query(Some(&write_query("/foo/bar"))), PermissionState::Granted);
+      assert_eq!(perms.write.query(Some(&write_query("/foo/specific"))), PermissionState::Denied);
+      assert_eq!(perms.ffi.query(Some(&ffi_query("/foo"))), PermissionState::GrantedPartial);
+      assert_eq!(perms.ffi.query(Some(&ffi_query("/foo/bar"))), PermissionState::Granted);
+      assert_eq!(perms.ffi.query(Some(&ffi_query("/foo/specific"))), PermissionState::Denied);
     };
   }
 
@@ -5470,8 +7111,7 @@ mod tests {
         .is_err()
     );
 
-    #[allow(clippy::disallowed_methods)]
-    let cwd = std::env::current_dir().unwrap();
+    let cwd = sys_traits::impls::RealSys.env_current_dir().unwrap();
     prompt_value.set(true);
     assert!(
       perms
@@ -5636,8 +7276,7 @@ mod tests {
     );
 
     prompt_value.set(false);
-    #[allow(clippy::disallowed_methods)]
-    let cwd = std::env::current_dir().unwrap();
+    let cwd = sys_traits::impls::RealSys.env_current_dir().unwrap();
     assert!(
       perms
         .run
@@ -5720,7 +7359,7 @@ mod tests {
     perms.env = UnaryPermission {
       granted_global: false,
       ..Permissions::new_unary(
-        Some(HashSet::from([EnvDescriptor::new(Cow::Borrowed("HOME"))])),
+        Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("HOME"))])),
         None,
         false,
       )
@@ -5743,7 +7382,7 @@ mod tests {
     perms.env = UnaryPermission {
       granted_global: false,
       ..Permissions::new_unary(
-        Some(HashSet::from([EnvDescriptor::new(Cow::Borrowed("HOME_*"))])),
+        Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("HOME_*"))])),
         None,
         false,
       )
@@ -5791,6 +7430,181 @@ mod tests {
         )
         .is_ok()
     );
+    {
+      let mut perms = Permissions::none_without_prompt();
+      perms.env = UnaryPermission {
+        granted_global: false,
+        ..Permissions::new_unary(
+          Some(Vec::from([
+            EnvDescriptor::new(Cow::Borrowed("PREFIX_ALLOWED*")),
+            EnvDescriptor::new(Cow::Borrowed("PREFIX_EXPLICIT_ALLOWED")),
+          ])),
+          Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("PREFIX*"))])),
+          false,
+        )
+      };
+      assert_eq!(
+        perms.env.query(Some("PREFIX_TEST")),
+        PermissionState::Denied
+      );
+      assert_eq!(
+        perms.env.query(Some("PREFIX_ALLOWED_TEST")),
+        PermissionState::Granted
+      );
+      assert_eq!(
+        perms.env.query(Some("PREFIX_EXPLICIT_ALLOWED")),
+        PermissionState::Granted
+      );
+    }
+  }
+
+  #[test]
+  fn test_env_ignore() {
+    set_prompter(Box::new(TestPrompter));
+    let _prompt_value = PERMISSION_PROMPT_STUB_VALUE_SETTER.lock();
+    {
+      let mut perms = Permissions::none_without_prompt();
+      perms.env = UnaryPermission {
+        granted_global: false,
+        ..Permissions::new_unary_with_ignore(
+          Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("ALLOWED_*"))])),
+          Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("DENIED_*"))])),
+          Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("IGNORED_*"))])),
+          false,
+        )
+      };
+      assert_eq!(
+        perms.env.query(Some("ALLOWED_TEST")),
+        PermissionState::Granted
+      );
+      assert_eq!(
+        perms.env.query(Some("IGNORED_TEST")),
+        PermissionState::Ignored
+      );
+      assert_eq!(
+        perms.env.query(Some("DENIED_TEST")),
+        PermissionState::Denied
+      );
+    }
+    {
+      let mut perms = Permissions::none_without_prompt();
+      perms.env = UnaryPermission {
+        granted_global: false,
+        ..Permissions::new_unary_with_ignore(
+          Some(Vec::from([EnvDescriptor::new(Cow::Borrowed(
+            "PREFIX_ALLOWED*",
+          ))])),
+          Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("PREFIX*"))])),
+          Some(Vec::from([EnvDescriptor::new(Cow::Borrowed(
+            "PREFIX_IGNORED*",
+          ))])),
+          false,
+        )
+      };
+      assert_eq!(
+        perms.env.query(Some("PREFIX_TEST")),
+        PermissionState::Denied
+      );
+      assert_eq!(
+        perms.env.query(Some("PREFIX_IGNORED_TEST")),
+        PermissionState::Ignored
+      );
+      assert_eq!(
+        perms.env.query(Some("PREFIX_ALLOWED_TEST")),
+        PermissionState::Granted
+      );
+    }
+  }
+
+  #[test]
+  fn test_read_ignore() {
+    set_prompter(Box::new(TestPrompter));
+    let _prompt_value = PERMISSION_PROMPT_STUB_VALUE_SETTER.lock();
+    let parser = TestPermissionDescriptorParser;
+    {
+      let mut perms = Permissions::none_without_prompt();
+      perms.read = UnaryPermission {
+        granted_global: false,
+        ..Permissions::new_unary_with_ignore(
+          Some(Vec::from([ReadDescriptor(
+            parser.join_path_with_root("allowed"),
+          )])),
+          Some(Vec::from([ReadDescriptor(
+            parser.join_path_with_root("denied"),
+          )])),
+          Some(Vec::from([ReadDescriptor(
+            parser.join_path_with_root("ignored"),
+          )])),
+          false,
+        )
+      };
+      let allowed_query = parser
+        .parse_path_query(Cow::Borrowed(Path::new("/allowed")))
+        .unwrap()
+        .into_read();
+      assert_eq!(
+        perms.read.query(Some(&allowed_query)),
+        PermissionState::Granted
+      );
+      let ignored_query = parser
+        .parse_path_query(Cow::Borrowed(Path::new("/ignored")))
+        .unwrap()
+        .into_read();
+      assert_eq!(
+        perms.read.query(Some(&ignored_query)),
+        PermissionState::Ignored
+      );
+      let denied_query = parser
+        .parse_path_query(Cow::Borrowed(Path::new("/denied")))
+        .unwrap()
+        .into_read();
+      assert_eq!(
+        perms.read.query(Some(&denied_query)),
+        PermissionState::Denied
+      );
+    }
+    {
+      let mut perms = Permissions::none_without_prompt();
+      perms.read = UnaryPermission {
+        granted_global: false,
+        ..Permissions::new_unary_with_ignore(
+          Some(Vec::from([ReadDescriptor(
+            parser.join_path_with_root("prefix/allowed"),
+          )])),
+          Some(Vec::from([ReadDescriptor(
+            parser.join_path_with_root("prefix"),
+          )])),
+          Some(Vec::from([ReadDescriptor(
+            parser.join_path_with_root("prefix/ignored"),
+          )])),
+          false,
+        )
+      };
+      let denied_query = parser
+        .parse_path_query(Cow::Borrowed(Path::new("/prefix/test")))
+        .unwrap()
+        .into_read();
+      assert_eq!(
+        perms.read.query(Some(&denied_query)),
+        PermissionState::Denied
+      );
+      let ignored_query = parser
+        .parse_path_query(Cow::Borrowed(Path::new("/prefix/ignored/test")))
+        .unwrap()
+        .into_read();
+      assert_eq!(
+        perms.read.query(Some(&ignored_query)),
+        PermissionState::Ignored
+      );
+      let allowed_query = parser
+        .parse_path_query(Cow::Borrowed(Path::new("/prefix/allowed/test")))
+        .unwrap()
+        .into_read();
+      assert_eq!(
+        perms.read.query(Some(&allowed_query)),
+        PermissionState::Granted
+      );
+    }
   }
 
   #[test]
@@ -5799,8 +7613,6 @@ mod tests {
     let mut perms = Permissions::from_options(
       &parser,
       &PermissionsOptions {
-        allow_read: Some(vec![]),
-        deny_read: Some(svec!["/foo/bar"]),
         allow_write: Some(vec![]),
         deny_write: Some(svec!["/foo/bar"]),
         ..Default::default()
@@ -5808,19 +7620,117 @@ mod tests {
     )
     .unwrap();
 
-    let read_query = parser
-      .parse_path_query(Cow::Borrowed(Path::new("/foo")))
-      .unwrap()
-      .into_read();
-    perms.read.check_partial(&read_query, None).unwrap();
-    assert!(perms.read.check(&read_query, None).is_err());
-
     let write_query = parser
       .parse_path_query(Cow::Borrowed(Path::new("/foo")))
       .unwrap()
       .into_write();
     perms.write.check_partial(&write_query, None).unwrap();
     assert!(perms.write.check(&write_query, None).is_err());
+  }
+
+  // Regression test for https://github.com/denoland/deno/issues/27622.
+  // Querying a path that is an ancestor of a denied path must succeed for
+  // single-path read/write operations (`check_partial`), even though the
+  // strict `check` continues to reject it.
+  #[test]
+  fn test_check_partial_ancestor_of_deny() {
+    let parser = TestPermissionDescriptorParser;
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(vec![]),
+        deny_read: Some(svec!["/mnt"]),
+        allow_write: Some(vec![]),
+        deny_write: Some(svec!["/foo/bar"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    let root_read = parser
+      .parse_path_query(Cow::Borrowed(Path::new("/")))
+      .unwrap()
+      .into_read();
+    perms.read.check_partial(&root_read, None).unwrap();
+    assert!(perms.read.check(&root_read, None).is_err());
+
+    let foo_write = parser
+      .parse_path_query(Cow::Borrowed(Path::new("/foo")))
+      .unwrap()
+      .into_write();
+    perms.write.check_partial(&foo_write, None).unwrap();
+    assert!(perms.write.check(&foo_write, None).is_err());
+
+    // The actually-denied path is still denied under partial semantics.
+    let mnt_read = parser
+      .parse_path_query(Cow::Borrowed(Path::new("/mnt")))
+      .unwrap()
+      .into_read();
+    assert!(perms.read.check_partial(&mnt_read, None).is_err());
+    let mnt_sub_read = parser
+      .parse_path_query(Cow::Borrowed(Path::new("/mnt/sub")))
+      .unwrap()
+      .into_read();
+    assert!(perms.read.check_partial(&mnt_sub_read, None).is_err());
+  }
+
+  // Recursive remove must keep strict deny semantics: `check_write` rejects an
+  // ancestor of a denied path, while the partial checks used by single-path ops
+  // (`check_write_partial`, `check_open`) allow it. Without this, a recursive
+  // `Deno.remove("/foo", { recursive: true })` under `--deny-write=/foo/bar`
+  // would delete the denied descendant.
+  #[test]
+  fn test_check_write_strict_for_recursive_remove() {
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_write: Some(vec![]),
+        deny_write: Some(svec!["/foo/bar"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    // Strict write check (used by recursive remove) rejects the ancestor.
+    assert!(
+      perms
+        .check_write(Cow::Borrowed(Path::new("/foo")), "Deno.removeSync()")
+        .is_err(),
+      "recursive remove of an ancestor of a denied path must be blocked"
+    );
+
+    // Partial checks (used by non-recursive remove and other single-path ops)
+    // allow the ancestor.
+    perms
+      .check_write_partial(
+        Cow::Borrowed(Path::new("/foo")),
+        "Deno.removeSync()",
+      )
+      .unwrap();
+    perms
+      .check_open(
+        Cow::Borrowed(Path::new("/foo")),
+        OpenAccessKind::WriteNoFollow,
+        Some("api"),
+      )
+      .unwrap();
+
+    // The denied path itself is rejected by every variant.
+    assert!(
+      perms
+        .check_write(Cow::Borrowed(Path::new("/foo/bar")), "Deno.removeSync()")
+        .is_err()
+    );
+    assert!(
+      perms
+        .check_write_partial(
+          Cow::Borrowed(Path::new("/foo/bar")),
+          "Deno.removeSync()"
+        )
+        .is_err()
+    );
   }
 
   #[test]
@@ -5902,6 +7812,75 @@ mod tests {
     for (host, is_ok) in cases {
       assert_eq!(perms.check_net(&(host, None), "api").is_ok(), is_ok);
     }
+  }
+
+  #[test]
+  fn test_net_ipv4_mapped_ipv6() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+
+    // Deny an IPv4 address, verify IPv4-mapped IPv6 form is also denied
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_net: Some(vec![]),
+        deny_net: Some(svec!["127.0.0.1"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let mut perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    // Direct IPv4 is denied
+    assert!(perms.check_net(&("127.0.0.1", None), "api").is_err());
+    // IPv4-mapped IPv6 form must also be denied
+    assert!(perms.check_net(&("::ffff:127.0.0.1", None), "api").is_err());
+    // Regular IPv6 loopback is a different address, should be allowed
+    assert!(perms.check_net(&("::1", None), "api").is_ok());
+    // Other IPv4 addresses should be allowed
+    assert!(perms.check_net(&("192.168.1.1", None), "api").is_ok());
+
+    // Allow an IPv4-mapped IPv6, verify it's accessible via IPv4 too
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_net: Some(svec!["[::ffff:10.0.0.1]"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let mut perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    assert!(perms.check_net(&("10.0.0.1", None), "api").is_ok());
+    assert!(perms.check_net(&("::ffff:10.0.0.1", None), "api").is_ok());
+
+    // Port-qualified: deny 127.0.0.1:8080, verify IPv4-mapped form
+    // with port is also denied (exercises the SocketAddr parse path)
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_net: Some(vec![]),
+        deny_net: Some(svec!["127.0.0.1:8080"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let mut perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    assert!(perms.check_net(&("127.0.0.1", Some(8080)), "api").is_err());
+    assert!(
+      perms
+        .check_net(&("::ffff:127.0.0.1", Some(8080)), "api")
+        .is_err()
+    );
+    // Different port should be allowed
+    assert!(
+      perms
+        .check_net(&("::ffff:127.0.0.1", Some(9090)), "api")
+        .is_ok()
+    );
   }
 
   #[test]
@@ -6069,11 +8048,9 @@ mod tests {
         .lock()
         .clone(),
       Permissions {
-        env: Permissions::new_unary(Some(HashSet::new()), None, false),
+        env: Permissions::new_unary(Some(Vec::new()), None, false),
         net: Permissions::new_unary(
-          Some(HashSet::from([
-            NetDescriptor::parse_for_list("foo").unwrap()
-          ])),
+          Some(Vec::from([NetDescriptor::parse_for_list("foo").unwrap()])),
           None,
           false
         ),
@@ -6135,8 +8112,18 @@ mod tests {
       worker_perms.inner.lock().clone()
     );
     assert_eq!(
-      main_perms.inner.lock().run.granted_list,
-      HashSet::from([
+      main_perms
+        .inner
+        .lock()
+        .run
+        .descriptors
+        .iter()
+        .filter_map(|d| match d {
+          UnaryPermissionDesc::Granted(d) => Some(d.clone()),
+          _ => None,
+        })
+        .collect::<Vec<_>>(),
+      Vec::from([
         AllowRunDescriptor(PathDescriptor::new_known_absolute(Cow::Owned(
           PathBuf::from("/bar")
         ))),
@@ -6181,8 +8168,28 @@ mod tests {
       .create_child_permissions(ChildPermissionsArg::none())
       .unwrap();
     assert_eq!(
-      worker_perms.inner.lock().write.flag_denied_list.clone(),
-      main_perms.inner.lock().write.flag_denied_list
+      worker_perms
+        .inner
+        .lock()
+        .write
+        .descriptors
+        .iter()
+        .filter_map(|d| match d {
+          UnaryPermissionDesc::FlagDenied(d) => Some(d.clone()),
+          _ => None,
+        })
+        .collect::<Vec<_>>(),
+      main_perms
+        .inner
+        .lock()
+        .write
+        .descriptors
+        .iter()
+        .filter_map(|d| match d {
+          UnaryPermissionDesc::FlagDenied(d) => Some(d.clone()),
+          _ => None,
+        })
+        .collect::<Vec<_>>()
     );
   }
 
@@ -6213,10 +8220,38 @@ mod tests {
       ("deno.land.", Some(Host::Fqdn(fqdn!("deno.land")))),
       (".deno.land", None),
       ("*.deno.land", None),
+      // IPv4-mapped IPv6 addresses are normalized to IPv4
       (
         "::ffff:1.1.1.1",
+        Some(Host::Ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))),
+      ),
+      (
+        "[::ffff:127.0.0.1]",
+        Some(Host::Ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))),
+      ),
+      // IPv6 addresses with zone indices
+      (
+        "fe80::1%18",
         Some(Host::Ip(IpAddr::V6(Ipv6Addr::new(
-          0, 0, 0, 0, 0, 0xffff, 0x0101, 0x0101,
+          0xfe80, 0, 0, 0, 0, 0, 0, 1,
+        )))),
+      ),
+      (
+        "[fe80::1%18]",
+        Some(Host::Ip(IpAddr::V6(Ipv6Addr::new(
+          0xfe80, 0, 0, 0, 0, 0, 0, 1,
+        )))),
+      ),
+      (
+        "fe80::1%eth0",
+        Some(Host::Ip(IpAddr::V6(Ipv6Addr::new(
+          0xfe80, 0, 0, 0, 0, 0, 0, 1,
+        )))),
+      ),
+      (
+        "[fe80::1%eth0]",
+        Some(Host::Ip(IpAddr::V6(Ipv6Addr::new(
+          0xfe80, 0, 0, 0, 0, 0, 0, 1,
         )))),
       ),
     ];
@@ -6260,10 +8295,38 @@ mod tests {
       ("1::1.", None),
       ("deno.land.", Some(Host::Fqdn(fqdn!("deno.land")))),
       (".deno.land", None),
+      // IPv4-mapped IPv6 addresses are normalized to IPv4
       (
         "::ffff:1.1.1.1",
+        Some(Host::Ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))),
+      ),
+      (
+        "[::ffff:127.0.0.1]",
+        Some(Host::Ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))),
+      ),
+      // IPv6 addresses with zone indices
+      (
+        "fe80::1%18",
         Some(Host::Ip(IpAddr::V6(Ipv6Addr::new(
-          0, 0, 0, 0, 0, 0xffff, 0x0101, 0x0101,
+          0xfe80, 0, 0, 0, 0, 0, 0, 1,
+        )))),
+      ),
+      (
+        "[fe80::1%18]",
+        Some(Host::Ip(IpAddr::V6(Ipv6Addr::new(
+          0xfe80, 0, 0, 0, 0, 0, 0, 1,
+        )))),
+      ),
+      (
+        "fe80::1%eth0",
+        Some(Host::Ip(IpAddr::V6(Ipv6Addr::new(
+          0xfe80, 0, 0, 0, 0, 0, 0, 1,
+        )))),
+      ),
+      (
+        "[fe80::1%eth0]",
+        Some(Host::Ip(IpAddr::V6(Ipv6Addr::new(
+          0xfe80, 0, 0, 0, 0, 0, 0, 1,
         )))),
       ),
     ];
@@ -6333,6 +8396,21 @@ mod tests {
       ),
       ("", None),
       ("deno.land..", None),
+      // IPv6 addresses with zone indices (bracketed with port)
+      (
+        "[fe80::1%18]:1234",
+        Some(NetDescriptor(
+          Host::Ip(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))),
+          Some(1234),
+        )),
+      ),
+      (
+        "[fe80::1%eth0]:8080",
+        Some(NetDescriptor(
+          Host::Ip(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))),
+          Some(8080),
+        )),
+      ),
     ];
 
     for (input, expected) in cases {
@@ -6410,6 +8488,63 @@ mod tests {
       ),
       ("", None),
       ("deno.land..", None),
+      // IPv6 addresses with zone indices (bracketed with port)
+      (
+        "[fe80::1%18]:1234",
+        Some(NetDescriptor(
+          Host::Ip(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))),
+          Some(1234),
+        )),
+      ),
+      (
+        "[fe80::1%eth0]:8080",
+        Some(NetDescriptor(
+          Host::Ip(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))),
+          Some(8080),
+        )),
+      ),
+      // Unix socket rules are POSIX paths on every host (including Windows
+      // `deno compile --target=linux`). Lexically normalize `.`/`..` at parse
+      // time so the rule matches the call-side path.
+      (
+        "unix:/var/run/docker.sock",
+        Some(NetDescriptor(
+          Host::UnixSocket(PathBuf::from("/var/run/docker.sock")),
+          None,
+        )),
+      ),
+      (
+        "unix:/var/run/../run/./docker.sock",
+        Some(NetDescriptor(
+          Host::UnixSocket(PathBuf::from("/var/run/docker.sock")),
+          None,
+        )),
+      ),
+      ("unix:", None),
+      ("unix:relative.sock", None),
+      #[cfg(unix)]
+      ("unix:C:\\sockets\\app.sock", None),
+      #[cfg(windows)]
+      (
+        r"unix:C:\sockets\app.sock",
+        Some(NetDescriptor(
+          Host::UnixSocket(
+            normalize_path(Cow::Owned(PathBuf::from(r"C:\sockets\app.sock")))
+              .into_owned(),
+          ),
+          None,
+        )),
+      ),
+      #[cfg(windows)]
+      (
+        r"unix:\\.\pipe\app",
+        Some(NetDescriptor(
+          Host::UnixSocket(PathBuf::from(r"\\.\pipe\app")),
+          None,
+        )),
+      ),
+      #[cfg(windows)]
+      (r"unix:\foo", None),
     ];
 
     for (input, expected) in cases {
@@ -6419,6 +8554,31 @@ mod tests {
         "'{input}'"
       );
     }
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn test_net_unix_named_pipe_match() {
+    // Same construction as PermissionsContainer::check_net_unix_socket:
+    // the query is the call-side path, not re-parsed as a unix: rule.
+    let allow = NetDescriptor::parse_for_list(r"unix:\\.\pipe\app").unwrap();
+    let query_hit =
+      NetDescriptor(Host::UnixSocket(PathBuf::from(r"\\.\pipe\app")), None);
+    let query_miss =
+      NetDescriptor(Host::UnixSocket(PathBuf::from(r"\\.\pipe\other")), None);
+    assert!(query_hit.matches_allow(&allow));
+    assert!(!query_miss.matches_allow(&allow));
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn test_unix_leading_backslash_error() {
+    let err = NetDescriptor::parse_for_list(r"unix:\foo").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+      msg.contains("leading '\\' is not an absolute path"),
+      "{msg}"
+    );
   }
 
   #[test]
@@ -6470,8 +8630,3127 @@ mod tests {
   }
 
   #[test]
+  fn test_env_sorting() {
+    let mut items = vec![
+      EnvDescriptor::new("TEST".into()),
+      EnvDescriptor::new("TEST*".into()),
+      EnvDescriptor::new("TEST2*".into()),
+      EnvDescriptor::new("TEST_TEST".into()),
+    ];
+    items.sort_by(|a, b| a.cmp_allow(b));
+    assert_eq!(
+      items
+        .into_iter()
+        .map(|i| match i {
+          EnvDescriptor::Name(name) => name.inner,
+          EnvDescriptor::PrefixPattern(name) => format!("{}*", name.inner),
+        })
+        .collect::<Vec<_>>(),
+      vec![
+        "TEST".to_string(),
+        "TEST_TEST".to_string(),
+        "TEST2*".to_string(),
+        "TEST*".to_string(),
+      ]
+    )
+  }
+
+  #[test]
   fn test_format_display_name() {
     assert_eq!(format_display_name(Cow::Borrowed("123")), "\"123\"");
     assert_eq!(format_display_name(Cow::Borrowed("<other>")), "<other>");
+  }
+
+  #[test]
+  fn test_path_ordering_multiple_allows_and_denies() {
+    let parser = TestPermissionDescriptorParser;
+    let read_query = |path: &str| {
+      parser
+        .parse_path_query(Cow::Owned(PathBuf::from(path)))
+        .unwrap()
+        .into_read()
+    };
+
+    // Test multiple overlapping allows and denies
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/foo/bar/baz", "/foo/qux"]),
+        deny_read: Some(svec!["/foo/bar", "/foo"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    // Most specific allow wins over less specific denies
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/bar/baz"))),
+      PermissionState::Granted
+    );
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/bar/baz/file.txt"))),
+      PermissionState::Granted
+    );
+
+    // Deny /foo/bar blocks this
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/bar"))),
+      PermissionState::Denied
+    );
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/bar/other"))),
+      PermissionState::Denied
+    );
+
+    // Allow /foo/qux works despite deny /foo
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/qux"))),
+      PermissionState::Granted
+    );
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/qux/file.txt"))),
+      PermissionState::Granted
+    );
+
+    // Deny /foo blocks everything else under /foo
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo"))),
+      PermissionState::Denied
+    );
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/other"))),
+      PermissionState::Denied
+    );
+
+    // Unrelated path is prompt
+    assert_eq!(
+      perms.read.query(Some(&read_query("/bar"))),
+      PermissionState::Prompt
+    );
+  }
+
+  #[test]
+  fn test_env_ordering_multiple_patterns() {
+    // Test multiple overlapping env patterns
+    let mut perms = Permissions::none_without_prompt();
+    perms.env = UnaryPermission {
+      granted_global: false,
+      ..Permissions::new_unary(
+        Some(Vec::from([
+          EnvDescriptor::new(Cow::Borrowed("NODE_ENV")),
+          EnvDescriptor::new(Cow::Borrowed("NODE_DEBUG_*")),
+          EnvDescriptor::new(Cow::Borrowed("DENO_*")),
+        ])),
+        Some(Vec::from([
+          EnvDescriptor::new(Cow::Borrowed("NODE_*")),
+          EnvDescriptor::new(Cow::Borrowed("DENO_SECRET")),
+        ])),
+        true,
+      )
+    };
+
+    // Exact match NODE_ENV beats pattern NODE_*
+    assert_eq!(perms.env.query(Some("NODE_ENV")), PermissionState::Granted);
+
+    // More specific pattern NODE_DEBUG_* beats less specific NODE_*
+    assert_eq!(
+      perms.env.query(Some("NODE_DEBUG_NATIVE")),
+      PermissionState::Granted
+    );
+
+    // NODE_* deny blocks other NODE_ vars
+    assert_eq!(perms.env.query(Some("NODE_PATH")), PermissionState::Denied);
+    assert_eq!(
+      perms.env.query(Some("NODE_OPTIONS")),
+      PermissionState::Denied
+    );
+
+    // DENO_* allow works for most vars
+    assert_eq!(perms.env.query(Some("DENO_DIR")), PermissionState::Granted);
+
+    // But DENO_SECRET exact deny overrides DENO_* allow
+    assert_eq!(
+      perms.env.query(Some("DENO_SECRET")),
+      PermissionState::Denied
+    );
+
+    assert_eq!(perms.env.query(Some("PATH")), PermissionState::Prompt);
+  }
+
+  #[test]
+  fn test_env_ordering_nested_patterns() {
+    // Test increasingly specific patterns
+    let mut perms = Permissions::none_without_prompt();
+    perms.env = UnaryPermission {
+      granted_global: false,
+      ..Permissions::new_unary(
+        Some(Vec::from([
+          EnvDescriptor::new(Cow::Borrowed("PREFIX_SUBPREFIX_ALLOWED*")),
+          EnvDescriptor::new(Cow::Borrowed("PREFIX_ALLOWED*")),
+        ])),
+        Some(Vec::from([
+          EnvDescriptor::new(Cow::Borrowed("PREFIX_SUBPREFIX*")),
+          EnvDescriptor::new(Cow::Borrowed("PREFIX*")),
+        ])),
+        false,
+      )
+    };
+
+    // Most specific allow pattern wins
+    assert_eq!(
+      perms.env.query(Some("PREFIX_SUBPREFIX_ALLOWED_VAR")),
+      PermissionState::Granted
+    );
+
+    // Less specific deny blocks this
+    assert_eq!(
+      perms.env.query(Some("PREFIX_SUBPREFIX_OTHER")),
+      PermissionState::Denied
+    );
+
+    // Medium specific allow wins
+    assert_eq!(
+      perms.env.query(Some("PREFIX_ALLOWED_VAR")),
+      PermissionState::Granted
+    );
+
+    // Least specific deny blocks everything else
+    assert_eq!(
+      perms.env.query(Some("PREFIX_OTHER")),
+      PermissionState::Denied
+    );
+  }
+
+  #[test]
+  fn test_net_ordering_with_ports() {
+    let parser = TestPermissionDescriptorParser;
+
+    // Test that host:port combinations are properly ordered
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_net: Some(svec!["example.com:8080", "example.com:443"]),
+        deny_net: Some(svec!["example.com"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    assert_eq!(
+      perms.net.query(Some(&NetDescriptor(
+        Host::must_parse("example.com"),
+        Some(8080)
+      ))),
+      PermissionState::Granted
+    );
+    assert_eq!(
+      perms.net.query(Some(&NetDescriptor(
+        Host::must_parse("example.com"),
+        Some(443)
+      ))),
+      PermissionState::Granted
+    );
+    assert_eq!(
+      perms.net.query(Some(&NetDescriptor(
+        Host::must_parse("example.com"),
+        Some(20)
+      ))),
+      PermissionState::Denied
+    );
+    assert_eq!(
+      perms
+        .net
+        .query(Some(&NetDescriptor(Host::must_parse("example.com"), None))),
+      PermissionState::Denied
+    );
+  }
+
+  #[test]
+  fn test_path_ordering_same_specificity() {
+    let parser = TestPermissionDescriptorParser;
+    let read_query = |path: &str| {
+      parser
+        .parse_path_query(Cow::Owned(PathBuf::from(path)))
+        .unwrap()
+        .into_read()
+    };
+
+    // When allow and deny have the same path, deny should win
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/foo/bar"]),
+        deny_read: Some(svec!["/foo/bar"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    // Deny should take precedence when specificity is equal
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/bar"))),
+      PermissionState::Denied
+    );
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/bar/file.txt"))),
+      PermissionState::Denied
+    );
+  }
+
+  #[test]
+  fn test_env_ordering_same_specificity() {
+    // When allow and deny have the same env var, deny should win
+    let mut perms = Permissions::none_without_prompt();
+    perms.env = UnaryPermission {
+      granted_global: false,
+      ..Permissions::new_unary(
+        Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("TEST_VAR"))])),
+        Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("TEST_VAR"))])),
+        false,
+      )
+    };
+
+    // Deny should take precedence
+    assert_eq!(perms.env.query(Some("TEST_VAR")), PermissionState::Denied);
+  }
+
+  #[test]
+  fn test_env_ordering_pattern_same_specificity() {
+    // When allow and deny have the same pattern, deny should win
+    let mut perms = Permissions::none_without_prompt();
+    perms.env = UnaryPermission {
+      granted_global: false,
+      ..Permissions::new_unary(
+        Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("TEST_*"))])),
+        Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("TEST_*"))])),
+        false,
+      )
+    };
+
+    // Deny should take precedence
+    assert_eq!(perms.env.query(Some("TEST_VAR")), PermissionState::Denied);
+    assert_eq!(
+      perms.env.query(Some("TEST_ANOTHER")),
+      PermissionState::Denied
+    );
+  }
+
+  #[test]
+  fn test_path_ordering_sibling_directories() {
+    let parser = TestPermissionDescriptorParser;
+    let read_query = |path: &str| {
+      parser
+        .parse_path_query(Cow::Owned(PathBuf::from(path)))
+        .unwrap()
+        .into_read()
+    };
+
+    // Test sibling directories (unrelated paths)
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/foo/a"]),
+        deny_read: Some(svec!["/foo/b"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/a"))),
+      PermissionState::Granted
+    );
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/a/file.txt"))),
+      PermissionState::Granted
+    );
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/b"))),
+      PermissionState::Denied
+    );
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/b/file.txt"))),
+      PermissionState::Denied
+    );
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/c"))),
+      PermissionState::Prompt
+    );
+  }
+
+  #[test]
+  fn test_write_ordering_deep_nesting() {
+    let parser = TestPermissionDescriptorParser;
+    let write_query = |path: &str| {
+      parser
+        .parse_path_query(Cow::Owned(PathBuf::from(path)))
+        .unwrap()
+        .into_write()
+    };
+
+    // Test deeply nested paths with multiple levels
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_write: Some(svec!["/a/b/c/d/e/f"]),
+        deny_write: Some(svec!["/a/b/c", "/a/b/c/d/e"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    // Most specific allow wins
+    assert_eq!(
+      perms.write.query(Some(&write_query("/a/b/c/d/e/f"))),
+      PermissionState::Granted
+    );
+    assert_eq!(
+      perms.write.query(Some(&write_query("/a/b/c/d/e/f/g"))),
+      PermissionState::Granted
+    );
+
+    // Deny at /a/b/c/d/e blocks this level
+    assert_eq!(
+      perms.write.query(Some(&write_query("/a/b/c/d/e"))),
+      PermissionState::Denied
+    );
+    assert_eq!(
+      perms.write.query(Some(&write_query("/a/b/c/d/e/other"))),
+      PermissionState::Denied
+    );
+
+    // Deny at /a/b/c blocks broader access
+    assert_eq!(
+      perms.write.query(Some(&write_query("/a/b/c"))),
+      PermissionState::Denied
+    );
+    assert_eq!(
+      perms.write.query(Some(&write_query("/a/b/c/d"))),
+      PermissionState::Denied
+    );
+
+    // Parent paths are prompt
+    assert_eq!(
+      perms.write.query(Some(&write_query("/a/b"))),
+      PermissionState::Prompt
+    );
+  }
+
+  #[test]
+  fn test_ffi_ordering_similar_paths() {
+    let parser = TestPermissionDescriptorParser;
+    let ffi_query = |path: &str| {
+      parser
+        .parse_path_query(Cow::Owned(PathBuf::from(path)))
+        .unwrap()
+        .into_ffi()
+    };
+
+    // Test paths that share common prefixes but aren't ancestors
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_ffi: Some(svec!["/usr/lib/custom", "/usr/lib64"]),
+        deny_ffi: Some(svec!["/usr/lib"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    // Allow should work for specific paths
+    assert_eq!(
+      perms.ffi.query(Some(&ffi_query("/usr/lib/custom"))),
+      PermissionState::Granted
+    );
+    assert_eq!(
+      perms
+        .ffi
+        .query(Some(&ffi_query("/usr/lib/custom/mylib.so"))),
+      PermissionState::Granted
+    );
+
+    // /usr/lib64 is not under /usr/lib, so should be prompt (not denied)
+    assert_eq!(
+      perms.ffi.query(Some(&ffi_query("/usr/lib64"))),
+      PermissionState::Granted
+    );
+
+    // Deny blocks /usr/lib
+    assert_eq!(
+      perms.ffi.query(Some(&ffi_query("/usr/lib"))),
+      PermissionState::Denied
+    );
+    assert_eq!(
+      perms.ffi.query(Some(&ffi_query("/usr/lib/other.so"))),
+      PermissionState::Denied
+    );
+  }
+
+  #[test]
+  fn test_env_ordering_empty_prefix_pattern() {
+    // Test edge case: what if someone tries a pattern that matches everything?
+    let mut perms = Permissions::none_without_prompt();
+    perms.env = UnaryPermission {
+      granted_global: false,
+      ..Permissions::new_unary(
+        Some(Vec::from([EnvDescriptor::new(Cow::Borrowed(
+          "ALLOWED_VAR",
+        ))])),
+        Some(Vec::from([EnvDescriptor::new(Cow::Borrowed("ALLOWED_*"))])),
+        false,
+      )
+    };
+
+    // Exact name ALLOWED_VAR should win over pattern ALLOWED_*
+    assert_eq!(
+      perms.env.query(Some("ALLOWED_VAR")),
+      PermissionState::Granted
+    );
+
+    // Pattern ALLOWED_* should deny others
+    assert_eq!(
+      perms.env.query(Some("ALLOWED_OTHER")),
+      PermissionState::Denied
+    );
+  }
+
+  #[test]
+  fn test_cmp_read_descriptors() {
+    let parser = TestPermissionDescriptorParser;
+    let parse_granted = |text: &str| {
+      UnaryPermissionDesc::Granted(parser.parse_read_descriptor(text).unwrap())
+    };
+    let parse_flag_denied = |text: &str| {
+      UnaryPermissionDesc::FlagDenied::<ReadDescriptor>(
+        parser.parse_read_descriptor(text).unwrap(),
+      )
+    };
+    let parse_prompt_denied = |text: &str| {
+      UnaryPermissionDesc::PromptDenied::<ReadDescriptor>(
+        parser.parse_read_descriptor(text).unwrap(),
+      )
+    };
+
+    // Test path hierarchy: child < parent for granted
+    check_comparison(
+      &parse_granted("/foo/bar"),
+      &parse_granted("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/foo/bar/baz"),
+      &parse_granted("/foo/bar"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/a/b/c/d"),
+      &parse_granted("/a"),
+      Ordering::Less,
+    );
+
+    // Test path hierarchy: child < parent for flag denied
+    check_comparison(
+      &parse_flag_denied("/foo/bar"),
+      &parse_flag_denied("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("/foo/bar/baz"),
+      &parse_flag_denied("/foo/bar"),
+      Ordering::Less,
+    );
+
+    // Test path hierarchy: child < parent for prompt denied
+    check_comparison(
+      &parse_prompt_denied("/foo/bar"),
+      &parse_prompt_denied("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo/bar/baz"),
+      &parse_prompt_denied("/foo/bar"),
+      Ordering::Less,
+    );
+
+    // Test equal paths with same type
+    check_comparison(
+      &parse_granted("/foo/bar"),
+      &parse_granted("/foo/bar"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_flag_denied("/foo/bar"),
+      &parse_flag_denied("/foo/bar"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo/bar"),
+      &parse_prompt_denied("/foo/bar"),
+      Ordering::Equal,
+    );
+
+    // Test unrelated paths (lexicographic ordering)
+    check_comparison(
+      &parse_granted("/aaa"),
+      &parse_granted("/bbb"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/xyz"),
+      &parse_granted("/abc"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_flag_denied("/aaa"),
+      &parse_flag_denied("/zzz"),
+      Ordering::Less,
+    );
+
+    // Test different types with same path
+    // FlagDenied < PromptDenied < Granted (by kind_precedence)
+    check_comparison(
+      &parse_flag_denied("/foo"),
+      &parse_granted("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo"),
+      &parse_granted("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("/foo"),
+      &parse_prompt_denied("/foo"),
+      Ordering::Less,
+    );
+
+    // Test different types with parent/child relationship
+    check_comparison(
+      &parse_granted("/foo/bar"),
+      &parse_flag_denied("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/foo"),
+      &parse_flag_denied("/foo/bar"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo/bar"),
+      &parse_granted("/foo"),
+      Ordering::Less,
+    );
+
+    // Test root vs subdirectories
+    check_comparison(
+      &parse_granted("/"),
+      &parse_granted("/foo"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_flag_denied("/"),
+      &parse_flag_denied("/foo"),
+      Ordering::Greater,
+    );
+
+    // Test deeply nested paths
+    check_comparison(
+      &parse_granted("/a/b/c/d/e/f"),
+      &parse_granted("/a/b/c"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/a/b/c"),
+      &parse_granted("/a/b/d"),
+      Ordering::Less,
+    );
+
+    // Test paths with similar prefixes but different branches
+    check_comparison(
+      &parse_granted("/foo/bar"),
+      &parse_granted("/foo/baz"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/prefix123"),
+      &parse_granted("/prefix456"),
+      Ordering::Less,
+    );
+
+    // Test two deny types with different descriptors (non-equal paths)
+    check_comparison(
+      &parse_flag_denied("/aaa"),
+      &parse_prompt_denied("/bbb"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("/xyz"),
+      &parse_prompt_denied("/abc"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo/bar"),
+      &parse_flag_denied("/foo/baz"),
+      Ordering::Less,
+    );
+
+    // Test transitivity: FlagDenied < PromptDenied < Granted with same path
+    check_comparison(
+      &parse_flag_denied("/test"),
+      &parse_prompt_denied("/test"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("/test"),
+      &parse_granted("/test"),
+      Ordering::Less,
+    );
+    // Transitive: FlagDenied < Granted
+    check_comparison(
+      &parse_flag_denied("/test"),
+      &parse_granted("/test"),
+      Ordering::Less,
+    );
+
+    // Test mixed types with sibling paths
+    check_comparison(
+      &parse_granted("/foo/bar"),
+      &parse_prompt_denied("/foo/baz"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_flag_denied("/foo/aaa"),
+      &parse_granted("/foo/zzz"),
+      Ordering::Less,
+    );
+
+    // Test PromptDenied(child) vs FlagDenied(parent)
+    check_comparison(
+      &parse_prompt_denied("/foo/bar/baz"),
+      &parse_flag_denied("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("/a/b/c"),
+      &parse_flag_denied("/a/b"),
+      Ordering::Less,
+    );
+  }
+
+  #[test]
+  fn test_cmp_write_descriptors() {
+    let parser = TestPermissionDescriptorParser;
+    let parse_granted = |text: &str| {
+      UnaryPermissionDesc::Granted(parser.parse_write_descriptor(text).unwrap())
+    };
+    let parse_flag_denied = |text: &str| {
+      UnaryPermissionDesc::FlagDenied::<WriteDescriptor>(
+        parser.parse_write_descriptor(text).unwrap(),
+      )
+    };
+    let parse_prompt_denied = |text: &str| {
+      UnaryPermissionDesc::PromptDenied::<WriteDescriptor>(
+        parser.parse_write_descriptor(text).unwrap(),
+      )
+    };
+
+    // Test path hierarchy: child < parent for granted
+    check_comparison(
+      &parse_granted("/foo/bar"),
+      &parse_granted("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/foo/bar/baz"),
+      &parse_granted("/foo/bar"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/a/b/c/d"),
+      &parse_granted("/a"),
+      Ordering::Less,
+    );
+
+    // Test path hierarchy: child < parent for flag denied
+    check_comparison(
+      &parse_flag_denied("/foo/bar"),
+      &parse_flag_denied("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("/foo/bar/baz"),
+      &parse_flag_denied("/foo/bar"),
+      Ordering::Less,
+    );
+
+    // Test path hierarchy: child < parent for prompt denied
+    check_comparison(
+      &parse_prompt_denied("/foo/bar"),
+      &parse_prompt_denied("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo/bar/baz"),
+      &parse_prompt_denied("/foo/bar"),
+      Ordering::Less,
+    );
+
+    // Test equal paths with same type
+    check_comparison(
+      &parse_granted("/foo/bar"),
+      &parse_granted("/foo/bar"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_flag_denied("/foo/bar"),
+      &parse_flag_denied("/foo/bar"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo/bar"),
+      &parse_prompt_denied("/foo/bar"),
+      Ordering::Equal,
+    );
+
+    // Test unrelated paths (lexicographic ordering)
+    check_comparison(
+      &parse_granted("/aaa"),
+      &parse_granted("/bbb"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/xyz"),
+      &parse_granted("/abc"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_flag_denied("/aaa"),
+      &parse_flag_denied("/zzz"),
+      Ordering::Less,
+    );
+
+    // Test different types with same path
+    // FlagDenied < PromptDenied < Granted (by kind_precedence)
+    check_comparison(
+      &parse_flag_denied("/foo"),
+      &parse_granted("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo"),
+      &parse_granted("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("/foo"),
+      &parse_prompt_denied("/foo"),
+      Ordering::Less,
+    );
+
+    // Test different types with parent/child relationship
+    check_comparison(
+      &parse_granted("/foo/bar"),
+      &parse_flag_denied("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/foo"),
+      &parse_flag_denied("/foo/bar"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo/bar"),
+      &parse_granted("/foo"),
+      Ordering::Less,
+    );
+
+    // Test root vs subdirectories
+    check_comparison(
+      &parse_granted("/"),
+      &parse_granted("/foo"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_flag_denied("/"),
+      &parse_flag_denied("/foo"),
+      Ordering::Greater,
+    );
+
+    // Test deeply nested paths
+    check_comparison(
+      &parse_granted("/a/b/c/d/e/f"),
+      &parse_granted("/a/b/c"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/a/b/c"),
+      &parse_granted("/a/b/d"),
+      Ordering::Less,
+    );
+
+    // Test paths with similar prefixes but different branches
+    check_comparison(
+      &parse_granted("/foo/bar"),
+      &parse_granted("/foo/baz"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/prefix123"),
+      &parse_granted("/prefix456"),
+      Ordering::Less,
+    );
+
+    // Test two deny types with different descriptors
+    check_comparison(
+      &parse_flag_denied("/aaa"),
+      &parse_prompt_denied("/bbb"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo/bar"),
+      &parse_flag_denied("/foo/baz"),
+      Ordering::Less,
+    );
+
+    // Test PromptDenied(child) vs FlagDenied(parent)
+    check_comparison(
+      &parse_prompt_denied("/foo/bar/baz"),
+      &parse_flag_denied("/foo"),
+      Ordering::Less,
+    );
+  }
+
+  #[test]
+  fn test_cmp_net_descriptors() {
+    let parser = TestPermissionDescriptorParser;
+    let parse_granted = |text: &str| {
+      UnaryPermissionDesc::Granted(parser.parse_net_descriptor(text).unwrap())
+    };
+    let parse_flag_denied = |text: &str| {
+      UnaryPermissionDesc::FlagDenied::<NetDescriptor>(
+        parser.parse_net_descriptor(text).unwrap(),
+      )
+    };
+    let parse_prompt_denied = |text: &str| {
+      UnaryPermissionDesc::PromptDenied::<NetDescriptor>(
+        parser.parse_net_descriptor(text).unwrap(),
+      )
+    };
+
+    // Test host hierarchy: more specific < less specific for granted
+    check_comparison(
+      &parse_granted("example.com:8080"),
+      &parse_granted("example.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("sub.example.com"),
+      &parse_granted("example.com"),
+      Ordering::Less,
+    );
+
+    // Test host hierarchy: more specific < less specific for flag denied
+    check_comparison(
+      &parse_flag_denied("example.com:8080"),
+      &parse_flag_denied("example.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("sub.example.com"),
+      &parse_flag_denied("example.com"),
+      Ordering::Less,
+    );
+
+    // Test host hierarchy: more specific < less specific for prompt denied
+    check_comparison(
+      &parse_prompt_denied("example.com:8080"),
+      &parse_prompt_denied("example.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("sub.example.com"),
+      &parse_prompt_denied("example.com"),
+      Ordering::Less,
+    );
+
+    // Test equal descriptors with same type
+    check_comparison(
+      &parse_granted("example.com:8080"),
+      &parse_granted("example.com:8080"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_flag_denied("example.com"),
+      &parse_flag_denied("example.com"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_prompt_denied("example.com:443"),
+      &parse_prompt_denied("example.com:443"),
+      Ordering::Equal,
+    );
+
+    // Test unrelated hosts (lexicographic ordering)
+    check_comparison(
+      &parse_granted("aaa.com"),
+      &parse_granted("bbb.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("xyz.org"),
+      &parse_granted("abc.org"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_flag_denied("aaa.com"),
+      &parse_flag_denied("zzz.com"),
+      Ordering::Less,
+    );
+
+    // Test different types with same descriptor
+    // FlagDenied < PromptDenied < Granted (by kind_precedence)
+    check_comparison(
+      &parse_flag_denied("example.com"),
+      &parse_granted("example.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("example.com"),
+      &parse_granted("example.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("example.com"),
+      &parse_prompt_denied("example.com"),
+      Ordering::Less,
+    );
+
+    // Test different types with hierarchy relationship
+    check_comparison(
+      &parse_granted("example.com:8080"),
+      &parse_flag_denied("example.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("example.com"),
+      &parse_flag_denied("example.com:8080"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_prompt_denied("example.com:8080"),
+      &parse_granted("example.com"),
+      Ordering::Less,
+    );
+
+    // Test port variations
+    check_comparison(
+      &parse_granted("example.com:80"),
+      &parse_granted("example.com:443"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("example.com:9000"),
+      &parse_granted("example.com:8080"),
+      Ordering::Greater,
+    );
+
+    // Test IP addresses
+    check_comparison(
+      &parse_granted("127.0.0.1:8080"),
+      &parse_granted("127.0.0.1"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("192.168.1.1"),
+      &parse_granted("10.0.0.1"),
+      Ordering::Greater,
+    );
+
+    // Test IPv6 addresses
+    check_comparison(
+      &parse_granted("[::1]:8080"),
+      &parse_granted("[::1]"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("[2001:db8::1]"),
+      &parse_granted("[::1]"),
+      Ordering::Greater,
+    );
+
+    // Test two deny types with different hosts
+    check_comparison(
+      &parse_flag_denied("aaa.com"),
+      &parse_prompt_denied("bbb.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("example.com:8080"),
+      &parse_flag_denied("example.com:9000"),
+      Ordering::Less,
+    );
+
+    // Test PromptDenied(specific) vs FlagDenied(general)
+    check_comparison(
+      &parse_prompt_denied("sub.example.com"),
+      &parse_flag_denied("example.com"),
+      Ordering::Less,
+    );
+  }
+
+  #[test]
+  fn test_cmp_env_descriptors() {
+    let parser = TestPermissionDescriptorParser;
+    let parse_granted = |text: &str| {
+      UnaryPermissionDesc::Granted(parser.parse_env_descriptor(text).unwrap())
+    };
+    let parse_flag_denied = |text: &str| {
+      UnaryPermissionDesc::FlagDenied::<EnvDescriptor>(
+        parser.parse_env_descriptor(text).unwrap(),
+      )
+    };
+    let parse_prompt_denied = |text: &str| {
+      UnaryPermissionDesc::PromptDenied::<EnvDescriptor>(
+        parser.parse_env_descriptor(text).unwrap(),
+      )
+    };
+
+    // Test variable name ordering for granted
+    check_comparison(
+      &parse_granted("AAA"),
+      &parse_granted("BBB"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("XYZ"),
+      &parse_granted("ABC"),
+      Ordering::Greater,
+    );
+
+    // Test variable name ordering for flag denied
+    check_comparison(
+      &parse_flag_denied("HOME"),
+      &parse_flag_denied("PATH"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("ZZZ"),
+      &parse_flag_denied("AAA"),
+      Ordering::Greater,
+    );
+
+    // Test variable name ordering for prompt denied
+    check_comparison(
+      &parse_prompt_denied("FOO"),
+      &parse_prompt_denied("BAR"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_prompt_denied("TEST_VAR"),
+      &parse_prompt_denied("TEST_VAR2"),
+      Ordering::Less,
+    );
+
+    // Test equal descriptors with same type
+    check_comparison(
+      &parse_granted("PATH"),
+      &parse_granted("PATH"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_flag_denied("HOME"),
+      &parse_flag_denied("HOME"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_prompt_denied("USER"),
+      &parse_prompt_denied("USER"),
+      Ordering::Equal,
+    );
+
+    // Test different types with same variable
+    // FlagDenied < PromptDenied < Granted (by kind_precedence)
+    check_comparison(
+      &parse_flag_denied("PATH"),
+      &parse_granted("PATH"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("PATH"),
+      &parse_granted("PATH"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("PATH"),
+      &parse_prompt_denied("PATH"),
+      Ordering::Less,
+    );
+
+    // Test different types with different variables
+    check_comparison(
+      &parse_granted("AAA"),
+      &parse_flag_denied("BBB"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("AAA"),
+      &parse_granted("BBB"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("XXX"),
+      &parse_granted("AAA"),
+      Ordering::Greater,
+    );
+
+    // Test common environment variables
+    check_comparison(
+      &parse_granted("HOME"),
+      &parse_granted("PATH"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("USER"),
+      &parse_granted("HOME"),
+      Ordering::Greater,
+    );
+
+    // Test two deny types with different variables
+    check_comparison(
+      &parse_flag_denied("AAA"),
+      &parse_prompt_denied("ZZZ"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("HOME"),
+      &parse_flag_denied("PATH"),
+      Ordering::Less,
+    );
+  }
+
+  #[test]
+  fn test_cmp_sys_descriptors() {
+    let parser = TestPermissionDescriptorParser;
+    let parse_granted = |text: &str| {
+      UnaryPermissionDesc::Granted(parser.parse_sys_descriptor(text).unwrap())
+    };
+    let parse_flag_denied = |text: &str| {
+      UnaryPermissionDesc::FlagDenied::<SysDescriptor>(
+        parser.parse_sys_descriptor(text).unwrap(),
+      )
+    };
+    let parse_prompt_denied = |text: &str| {
+      UnaryPermissionDesc::PromptDenied::<SysDescriptor>(
+        parser.parse_sys_descriptor(text).unwrap(),
+      )
+    };
+
+    // Test system info kind ordering for granted
+    check_comparison(
+      &parse_granted("hostname"),
+      &parse_granted("osRelease"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("uid"),
+      &parse_granted("hostname"),
+      Ordering::Greater,
+    );
+
+    // Test system info kind ordering for flag denied
+    check_comparison(
+      &parse_flag_denied("cpus"),
+      &parse_flag_denied("loadavg"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("osRelease"),
+      &parse_flag_denied("cpus"),
+      Ordering::Greater,
+    );
+
+    // Test system info kind ordering for prompt denied
+    check_comparison(
+      &parse_prompt_denied("hostname"),
+      &parse_prompt_denied("loadavg"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("uid"),
+      &parse_prompt_denied("gid"),
+      Ordering::Greater,
+    );
+
+    // Test equal descriptors with same type
+    check_comparison(
+      &parse_granted("hostname"),
+      &parse_granted("hostname"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_flag_denied("osRelease"),
+      &parse_flag_denied("osRelease"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_prompt_denied("cpus"),
+      &parse_prompt_denied("cpus"),
+      Ordering::Equal,
+    );
+
+    // Test different types with same kind
+    // FlagDenied < PromptDenied < Granted (by kind_precedence)
+    check_comparison(
+      &parse_flag_denied("hostname"),
+      &parse_granted("hostname"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("hostname"),
+      &parse_granted("hostname"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("hostname"),
+      &parse_prompt_denied("hostname"),
+      Ordering::Less,
+    );
+
+    // Test different types with different kinds
+    check_comparison(
+      &parse_granted("cpus"),
+      &parse_flag_denied("loadavg"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_flag_denied("cpus"),
+      &parse_granted("loadavg"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("uid"),
+      &parse_granted("hostname"),
+      Ordering::Less,
+    );
+
+    // Test various system info kinds
+    check_comparison(
+      &parse_granted("gid"),
+      &parse_granted("uid"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("loadavg"),
+      &parse_granted("hostname"),
+      Ordering::Greater,
+    );
+
+    // Test two deny types with different kinds
+    check_comparison(
+      &parse_flag_denied("cpus"),
+      &parse_prompt_denied("uid"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("hostname"),
+      &parse_flag_denied("osRelease"),
+      Ordering::Less,
+    );
+  }
+
+  #[test]
+  fn test_cmp_ffi_descriptors() {
+    let parser = TestPermissionDescriptorParser;
+    let parse_granted = |text: &str| {
+      UnaryPermissionDesc::Granted(parser.parse_ffi_descriptor(text).unwrap())
+    };
+    let parse_flag_denied = |text: &str| {
+      UnaryPermissionDesc::FlagDenied::<FfiDescriptor>(
+        parser.parse_ffi_descriptor(text).unwrap(),
+      )
+    };
+    let parse_prompt_denied = |text: &str| {
+      UnaryPermissionDesc::PromptDenied::<FfiDescriptor>(
+        parser.parse_ffi_descriptor(text).unwrap(),
+      )
+    };
+
+    // Test path hierarchy: child < parent for granted
+    check_comparison(
+      &parse_granted("/foo/bar"),
+      &parse_granted("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/foo/bar/baz.so"),
+      &parse_granted("/foo/bar"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/lib/native/module.so"),
+      &parse_granted("/lib"),
+      Ordering::Less,
+    );
+
+    // Test path hierarchy: child < parent for flag denied
+    check_comparison(
+      &parse_flag_denied("/foo/bar"),
+      &parse_flag_denied("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("/foo/bar/baz.dylib"),
+      &parse_flag_denied("/foo/bar"),
+      Ordering::Less,
+    );
+
+    // Test path hierarchy: child < parent for prompt denied
+    check_comparison(
+      &parse_prompt_denied("/foo/bar"),
+      &parse_prompt_denied("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo/bar/baz.dll"),
+      &parse_prompt_denied("/foo/bar"),
+      Ordering::Less,
+    );
+
+    // Test equal paths with same type
+    check_comparison(
+      &parse_granted("/lib/native.so"),
+      &parse_granted("/lib/native.so"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_flag_denied("/lib/native.so"),
+      &parse_flag_denied("/lib/native.so"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_prompt_denied("/lib/native.so"),
+      &parse_prompt_denied("/lib/native.so"),
+      Ordering::Equal,
+    );
+
+    // Test unrelated paths (lexicographic ordering)
+    check_comparison(
+      &parse_granted("/aaa/lib.so"),
+      &parse_granted("/bbb/lib.so"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/xyz/lib.so"),
+      &parse_granted("/abc/lib.so"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_flag_denied("/aaa/lib.so"),
+      &parse_flag_denied("/zzz/lib.so"),
+      Ordering::Less,
+    );
+
+    // Test different types with same path
+    // FlagDenied < PromptDenied < Granted (by kind_precedence)
+    check_comparison(
+      &parse_flag_denied("/lib/native.so"),
+      &parse_granted("/lib/native.so"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("/lib/native.so"),
+      &parse_granted("/lib/native.so"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("/lib/native.so"),
+      &parse_prompt_denied("/lib/native.so"),
+      Ordering::Less,
+    );
+
+    // Test different types with parent/child relationship
+    check_comparison(
+      &parse_granted("/foo/bar/lib.so"),
+      &parse_flag_denied("/foo"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/foo"),
+      &parse_flag_denied("/foo/bar/lib.so"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo/bar/lib.so"),
+      &parse_granted("/foo"),
+      Ordering::Less,
+    );
+
+    // Test root vs subdirectories
+    check_comparison(
+      &parse_granted("/"),
+      &parse_granted("/foo"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_flag_denied("/"),
+      &parse_flag_denied("/foo"),
+      Ordering::Greater,
+    );
+
+    // Test deeply nested paths
+    check_comparison(
+      &parse_granted("/a/b/c/d/e/f.so"),
+      &parse_granted("/a/b/c"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/a/b/c"),
+      &parse_granted("/a/b/d"),
+      Ordering::Less,
+    );
+
+    // Test paths with similar prefixes but different branches
+    check_comparison(
+      &parse_granted("/foo/bar.so"),
+      &parse_granted("/foo/baz.so"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("/lib/native1.so"),
+      &parse_granted("/lib/native2.so"),
+      Ordering::Less,
+    );
+
+    // Test two deny types with different paths
+    check_comparison(
+      &parse_flag_denied("/aaa/lib.so"),
+      &parse_prompt_denied("/bbb/lib.so"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("/foo/bar.so"),
+      &parse_flag_denied("/foo/baz.so"),
+      Ordering::Less,
+    );
+
+    // Test PromptDenied(child) vs FlagDenied(parent)
+    check_comparison(
+      &parse_prompt_denied("/foo/bar/lib.so"),
+      &parse_flag_denied("/foo"),
+      Ordering::Less,
+    );
+  }
+
+  #[test]
+  fn test_cmp_import_descriptors() {
+    let parser = TestPermissionDescriptorParser;
+    let parse_granted = |text: &str| {
+      UnaryPermissionDesc::Granted(
+        parser.parse_import_descriptor(text).unwrap(),
+      )
+    };
+    let parse_flag_denied = |text: &str| {
+      UnaryPermissionDesc::FlagDenied::<ImportDescriptor>(
+        parser.parse_import_descriptor(text).unwrap(),
+      )
+    };
+    let parse_prompt_denied = |text: &str| {
+      UnaryPermissionDesc::PromptDenied::<ImportDescriptor>(
+        parser.parse_import_descriptor(text).unwrap(),
+      )
+    };
+
+    // Test host hierarchy: more specific < less specific for granted
+    check_comparison(
+      &parse_granted("example.com:8080"),
+      &parse_granted("example.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("sub.example.com"),
+      &parse_granted("example.com"),
+      Ordering::Less,
+    );
+
+    // Test host hierarchy: more specific < less specific for flag denied
+    check_comparison(
+      &parse_flag_denied("example.com:8080"),
+      &parse_flag_denied("example.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("sub.example.com"),
+      &parse_flag_denied("example.com"),
+      Ordering::Less,
+    );
+
+    // Test host hierarchy: more specific < less specific for prompt denied
+    check_comparison(
+      &parse_prompt_denied("example.com:8080"),
+      &parse_prompt_denied("example.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("sub.example.com"),
+      &parse_prompt_denied("example.com"),
+      Ordering::Less,
+    );
+
+    // Test equal descriptors with same type
+    check_comparison(
+      &parse_granted("deno.land"),
+      &parse_granted("deno.land"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_flag_denied("deno.land"),
+      &parse_flag_denied("deno.land"),
+      Ordering::Equal,
+    );
+    check_comparison(
+      &parse_prompt_denied("deno.land:443"),
+      &parse_prompt_denied("deno.land:443"),
+      Ordering::Equal,
+    );
+
+    // Test unrelated hosts (lexicographic ordering)
+    check_comparison(
+      &parse_granted("aaa.com"),
+      &parse_granted("bbb.com"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("xyz.org"),
+      &parse_granted("abc.org"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_flag_denied("aaa.com"),
+      &parse_flag_denied("zzz.com"),
+      Ordering::Less,
+    );
+
+    // Test different types with same descriptor
+    // FlagDenied < PromptDenied < Granted (by kind_precedence)
+    check_comparison(
+      &parse_flag_denied("deno.land"),
+      &parse_granted("deno.land"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("deno.land"),
+      &parse_granted("deno.land"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_flag_denied("deno.land"),
+      &parse_prompt_denied("deno.land"),
+      Ordering::Less,
+    );
+
+    // Test different types with hierarchy relationship
+    check_comparison(
+      &parse_granted("deno.land:8080"),
+      &parse_flag_denied("deno.land"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("deno.land"),
+      &parse_flag_denied("deno.land:8080"),
+      Ordering::Greater,
+    );
+    check_comparison(
+      &parse_prompt_denied("deno.land:8080"),
+      &parse_granted("deno.land"),
+      Ordering::Less,
+    );
+
+    // Test port variations
+    check_comparison(
+      &parse_granted("deno.land:80"),
+      &parse_granted("deno.land:443"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_granted("deno.land:9000"),
+      &parse_granted("deno.land:8080"),
+      Ordering::Greater,
+    );
+
+    // Test two deny types with different hosts
+    check_comparison(
+      &parse_flag_denied("aaa.land"),
+      &parse_prompt_denied("zzz.land"),
+      Ordering::Less,
+    );
+    check_comparison(
+      &parse_prompt_denied("deno.land:8080"),
+      &parse_flag_denied("deno.land:9000"),
+      Ordering::Less,
+    );
+
+    // Test PromptDenied(specific) vs FlagDenied(general)
+    check_comparison(
+      &parse_prompt_denied("sub.deno.land"),
+      &parse_flag_denied("deno.land"),
+      Ordering::Less,
+    );
+  }
+
+  #[track_caller]
+  fn check_comparison<TAllowDesc: AllowDescriptor>(
+    first: &UnaryPermissionDesc<TAllowDesc>,
+    second: &UnaryPermissionDesc<TAllowDesc>,
+    expected: Ordering,
+  ) {
+    assert_eq!(first.cmp(second), expected);
+    assert_eq!(
+      second.cmp(first),
+      match expected {
+        Ordering::Less => Ordering::Greater,
+        Ordering::Greater => Ordering::Less,
+        Ordering::Equal => Ordering::Equal,
+      },
+      "failed second to first"
+    );
+  }
+
+  #[test]
+  #[cfg(windows)]
+  fn check_path_case_insensitive() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["C:\\Users\\Admin"]),
+        deny_read: Some(svec!["C:\\Users\\Admin\\Secret"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    // Matching case should be allowed
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("C:\\Users\\Admin\\file.txt")),
+          OpenAccessKind::Read,
+          Some("api"),
+        )
+        .is_ok()
+    );
+
+    // Different case should also be allowed
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("c:\\users\\admin\\file.txt")),
+          OpenAccessKind::Read,
+          Some("api"),
+        )
+        .is_ok()
+    );
+
+    // Deny with matching case should block
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("C:\\Users\\Admin\\Secret\\data.txt")),
+          OpenAccessKind::Read,
+          Some("api"),
+        )
+        .is_err()
+    );
+
+    // Deny with different case should also block
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("c:\\users\\admin\\secret\\data.txt")),
+          OpenAccessKind::Read,
+          Some("api"),
+        )
+        .is_err()
+    );
+  }
+
+  #[test]
+  #[cfg(windows)]
+  fn path_descriptor_verbatim_prefix_equivalent() {
+    // A `\\?\` verbatim (extended-length) path and its regular form refer to
+    // the same file, so the permission system must treat them as equal
+    // (denoland/deno#18597).
+    let regular = PathDescriptor::new_known_absolute(Cow::Borrowed(Path::new(
+      "C:\\Users\\Admin",
+    )));
+    let verbatim = PathDescriptor::new_known_absolute(Cow::Borrowed(
+      Path::new("\\\\?\\C:\\Users\\Admin"),
+    ));
+    assert_eq!(regular, verbatim);
+    // The stored path is the simplified form, not the verbatim one.
+    assert_eq!(verbatim.path, PathBuf::from("C:\\Users\\Admin"));
+
+    // A `\\?\` query is contained by a grant made with the regular path...
+    let query = PathQueryDescriptor::new_known_absolute(Cow::Borrowed(
+      Path::new("\\\\?\\C:\\Users\\Admin\\file.txt"),
+    ));
+    assert!(query.starts_with(&regular));
+    // ...and a regular query is contained by a grant made with a `\\?\` path.
+    let query = PathQueryDescriptor::new_known_absolute(Cow::Borrowed(
+      Path::new("C:\\Users\\Admin\\file.txt"),
+    ));
+    assert!(query.starts_with(&verbatim));
+
+    // An unrelated verbatim path is not contained.
+    let query = PathQueryDescriptor::new_known_absolute(Cow::Borrowed(
+      Path::new("\\\\?\\C:\\Other\\file.txt"),
+    ));
+    assert!(!query.starts_with(&regular));
+  }
+
+  #[test]
+  fn test_is_allow_all_edge_cases() {
+    let parser = TestPermissionDescriptorParser;
+
+    // granted_global alone => is_allow_all true
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(vec![]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(perms.read.is_allow_all());
+
+    // granted_global + flag_ignored_global => is_allow_all false
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(vec![]),
+        ignore_read: Some(vec![]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(!perms.read.is_allow_all());
+
+    // granted_global + flag_denied_global => is_allow_all false
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(vec![]),
+        deny_read: Some(vec![]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(!perms.read.is_allow_all());
+
+    // granted_global + specific deny descriptor => is_allow_all false
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(vec![]),
+        deny_read: Some(svec!["/secret"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(!perms.read.is_allow_all());
+
+    // granted_global + specific ignore descriptor => is_allow_all false
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(vec![]),
+        ignore_read: Some(svec!["/secret"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(!perms.read.is_allow_all());
+
+    // specific allow only (not global) => is_allow_all false
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/foo"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(!perms.read.is_allow_all());
+
+    // no permissions at all => is_allow_all false
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(!perms.read.is_allow_all());
+  }
+
+  #[test]
+  fn test_revoke_and_requery_state_transitions() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+    let read_query = |path: &str| {
+      parser
+        .parse_path_query(Cow::Owned(PathBuf::from(path)))
+        .unwrap()
+        .into_read()
+    };
+
+    // Revoke specific path, then query child path
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/foo"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/bar"))),
+      PermissionState::Granted
+    );
+    perms.read.revoke(Some(&read_query("/foo")));
+    // After revoking /foo, child path /foo/bar should also be prompt
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/bar"))),
+      PermissionState::Prompt
+    );
+
+    // Revoke after prompt-granted
+    let mut perms = Permissions::none_with_prompt();
+    let prompt_value = PERMISSION_PROMPT_STUB_VALUE_SETTER.lock();
+    prompt_value.set(true);
+    assert_eq!(
+      perms.read.request(Some(&read_query("/foo"))),
+      PermissionState::Granted
+    );
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo"))),
+      PermissionState::Granted
+    );
+    perms.read.revoke(Some(&read_query("/foo")));
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo"))),
+      PermissionState::Prompt
+    );
+
+    // Revoke global, then check specific descriptor still denied
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(vec![]),
+        deny_read: Some(svec!["/secret"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo"))),
+      PermissionState::Granted
+    );
+    perms.read.revoke(None);
+    // /secret should still be denied (flag deny persists after revoke)
+    assert_eq!(
+      perms.read.query(Some(&read_query("/secret"))),
+      PermissionState::Denied
+    );
+    // Other paths should be prompt after global revoke
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo"))),
+      PermissionState::Prompt
+    );
+  }
+
+  #[test]
+  fn test_prompt_denied_accumulation_and_stronger_than() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+    let read_query = |path: &str| {
+      parser
+        .parse_path_query(Cow::Owned(PathBuf::from(path)))
+        .unwrap()
+        .into_read()
+    };
+
+    let mut perms = Permissions::none_with_prompt();
+    let prompt_value = PERMISSION_PROMPT_STUB_VALUE_SETTER.lock();
+
+    // Deny /foo at prompt, then check /foo/bar
+    // Unlike flag denials, prompt denials use stronger_than_deny which only
+    // blocks when the query path encompasses the denied path (parent of
+    // denied), not child paths.
+    prompt_value.set(false);
+    assert_eq!(
+      perms.read.request(Some(&read_query("/foo"))),
+      PermissionState::Denied
+    );
+    // /foo/bar is a child of prompt-denied /foo, but prompt denials don't
+    // propagate to children -- only flag denials do
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo/bar"))),
+      PermissionState::Prompt
+    );
+    // /foo itself should still be denied
+    assert_eq!(
+      perms.read.query(Some(&read_query("/foo"))),
+      PermissionState::Denied
+    );
+
+    // Deny /bar/baz at prompt, then check /bar (parent) -- parent
+    // encompasses the denied child, so stronger_than_deny returns true
+    prompt_value.set(false);
+    assert_eq!(
+      perms.read.request(Some(&read_query("/bar/baz"))),
+      PermissionState::Denied
+    );
+    // Parent path /bar is "stronger than" prompt-deny of /bar/baz, so it
+    // is also denied
+    assert_eq!(
+      perms.read.query(Some(&read_query("/bar"))),
+      PermissionState::Denied
+    );
+
+    // Multiple prompt denials accumulate
+    prompt_value.set(false);
+    assert_eq!(
+      perms.read.request(Some(&read_query("/x"))),
+      PermissionState::Denied
+    );
+    prompt_value.set(false);
+    assert_eq!(
+      perms.read.request(Some(&read_query("/y"))),
+      PermissionState::Denied
+    );
+    // Both should remain denied
+    assert_eq!(
+      perms.read.query(Some(&read_query("/x"))),
+      PermissionState::Denied
+    );
+    assert_eq!(
+      perms.read.query(Some(&read_query("/y"))),
+      PermissionState::Denied
+    );
+    // Unrelated path still promptable
+    assert_eq!(
+      perms.read.query(Some(&read_query("/z"))),
+      PermissionState::Prompt
+    );
+  }
+
+  #[test]
+  fn test_allow_deny_ignore_three_way_interaction() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+    let read_query = |path: &str| {
+      parser
+        .parse_path_query(Cow::Owned(PathBuf::from(path)))
+        .unwrap()
+        .into_read()
+    };
+
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/home"]),
+        deny_read: Some(svec!["/home/secret"]),
+        ignore_read: Some(svec!["/home/.cache"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    // Regular file under /home => allowed
+    assert_eq!(
+      perms.read.query(Some(&read_query("/home/file.txt"))),
+      PermissionState::Granted
+    );
+    // File under /home/secret => denied
+    assert_eq!(
+      perms.read.query(Some(&read_query("/home/secret/key"))),
+      PermissionState::Denied
+    );
+    // File under /home/.cache => ignored (stealth deny)
+    assert_eq!(
+      perms.read.query(Some(&read_query("/home/.cache/data"))),
+      PermissionState::Ignored
+    );
+    // /home itself => GrantedPartial (has deny and ignore holes)
+    assert_eq!(
+      perms.read.query(Some(&read_query("/home"))),
+      PermissionState::GrantedPartial
+    );
+    // Outside /home => prompt
+    assert_eq!(
+      perms.read.query(Some(&read_query("/etc/passwd"))),
+      PermissionState::Prompt
+    );
+  }
+
+  #[test]
+  fn test_check_all_api_with_specific_allows_only() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+
+    // Specific allows only (not global) => check_all should fail
+    // (no prompt available)
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/foo"]),
+        prompt: false,
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(perms.read.check_all(None).is_err());
+
+    // Global allow => check_all should succeed
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(vec![]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(perms.read.check_all(None).is_ok());
+
+    // Global allow + specific deny => check_all still succeeds because
+    // check_desc uses AllowPartial::TreatAsGranted for non-partial checks
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(vec![]),
+        deny_read: Some(svec!["/secret"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(perms.read.check_all(None).is_ok());
+
+    // Global allow + global deny => check_all should fail
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(vec![]),
+        deny_read: Some(vec![]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(perms.read.check_all(None).is_err());
+
+    // Prompt-granted paths only => check_all should fail (not global,
+    // no prompt)
+    let mut perms = Permissions::none_with_prompt();
+    let prompt_value = PERMISSION_PROMPT_STUB_VALUE_SETTER.lock();
+    prompt_value.set(true);
+    let read_query = parser
+      .parse_path_query(Cow::Owned(PathBuf::from("/foo")))
+      .unwrap()
+      .into_read();
+    assert!(perms.read.check(&read_query, None).is_ok());
+    // Even though /foo was granted via prompt, check_all queries global
+    // state. With prompt enabled it will try to prompt for global, and
+    // the prompter returns true, so it grants global
+    prompt_value.set(false);
+    // Now prompter will deny the global prompt
+    assert!(perms.read.check_all(None).is_err());
+  }
+
+  #[test]
+  fn test_import_permission_check_and_deny() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+
+    // Import with allow and deny
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_import: Some(svec!["deno.land:443", "jsr.io:443"]),
+        deny_import: Some(svec!["evil.com:443"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    // Allowed host
+    assert!(
+      perms
+        .import
+        .check(
+          &ImportDescriptor(NetDescriptor(
+            Host::must_parse("deno.land"),
+            Some(443)
+          )),
+          None,
+        )
+        .is_ok()
+    );
+
+    // Denied host
+    assert!(
+      perms
+        .import
+        .check(
+          &ImportDescriptor(NetDescriptor(
+            Host::must_parse("evil.com"),
+            Some(443)
+          )),
+          None,
+        )
+        .is_err()
+    );
+
+    // Not in allow list => denied (no prompt)
+    assert!(
+      perms
+        .import
+        .check(
+          &ImportDescriptor(NetDescriptor(
+            Host::must_parse("unknown.com"),
+            Some(443)
+          )),
+          None,
+        )
+        .is_err()
+    );
+
+    // Global import allow with deny override
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_import: Some(vec![]),
+        deny_import: Some(svec!["evil.com:443"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+
+    // Allowed (global grant)
+    assert!(
+      perms
+        .import
+        .check(
+          &ImportDescriptor(NetDescriptor(
+            Host::must_parse("deno.land"),
+            Some(443)
+          )),
+          None,
+        )
+        .is_ok()
+    );
+
+    // Denied (explicit deny overrides global allow)
+    assert!(
+      perms
+        .import
+        .check(
+          &ImportDescriptor(NetDescriptor(
+            Host::must_parse("evil.com"),
+            Some(443)
+          )),
+          None,
+        )
+        .is_err()
+    );
+
+    // check_all with global allow + specific deny succeeds because
+    // check_desc uses AllowPartial::TreatAsGranted
+    assert!(perms.import.check_all().is_ok());
+
+    // check_all with global allow + global deny fails
+    let mut perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_import: Some(vec![]),
+        deny_import: Some(vec![]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(perms.import.check_all().is_err());
+  }
+
+  #[test]
+  fn test_check_open_read_write() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+
+    // ReadWrite requires both read AND write
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/data"]),
+        allow_write: Some(svec!["/data"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    // ReadWrite on allowed path => ok
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("/data/file.txt")),
+          OpenAccessKind::ReadWrite,
+          Some("api"),
+        )
+        .is_ok()
+    );
+
+    // ReadWrite on path with only read => err
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["/readonly"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let perms = PermissionsContainer::new(Arc::new(parser), perms);
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("/readonly/file.txt")),
+          OpenAccessKind::ReadWrite,
+          Some("api"),
+        )
+        .is_err()
+    );
+
+    // ReadWrite on path with only write => err
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_write: Some(svec!["/writeonly"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let perms = PermissionsContainer::new(Arc::new(parser), perms);
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("/writeonly/file.txt")),
+          OpenAccessKind::ReadWrite,
+          Some("api"),
+        )
+        .is_err()
+    );
+  }
+
+  #[test]
+  fn test_allow_run_auto_deny_write() {
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_run: Some(svec!["/usr/bin/node"]),
+        allow_write: Some(vec![]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    // Writing to allowed run path should be denied
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("/usr/bin/node")),
+          OpenAccessKind::Write,
+          Some("api"),
+        )
+        .is_err()
+    );
+
+    // Writing to other paths should be allowed (global write is granted)
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("/tmp/file.txt")),
+          OpenAccessKind::Write,
+          Some("api"),
+        )
+        .is_ok()
+    );
+  }
+
+  #[test]
+  fn test_net_fqdn_with_subdomain_wildcard() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_net: Some(svec!["*.example.com"]),
+        deny_net: Some(svec!["*.evil.com"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let mut perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    // Subdomain should match wildcard allow
+    assert!(perms.check_net(&("sub.example.com", None), "api").is_ok());
+    assert!(
+      perms
+        .check_net(&("deep.sub.example.com", None), "api")
+        .is_ok()
+    );
+
+    // Bare domain DOES match wildcard: *.example.com matches example.com
+    // because the fqdn crate's is_subdomain_of is inclusive (a domain is a
+    // subdomain of itself). This is intentional and consistent with the
+    // existing test_check_net_with_values test for *.discord.gg.
+    assert!(perms.check_net(&("example.com", None), "api").is_ok());
+
+    // Subdomain of denied wildcard should be denied
+    assert!(perms.check_net(&("sub.evil.com", None), "api").is_err());
+
+    // Bare domain also matches wildcard deny (same inclusive semantics)
+    assert!(perms.check_net(&("evil.com", None), "api").is_err());
+
+    // Unrelated domain should prompt (denied since no-prompt by default
+    // in test)
+    assert!(perms.check_net(&("other.com", None), "api").is_err());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn test_net_unix_socket_path_equivalence() {
+    // Regression test: on case-insensitive filesystems a case-variant
+    // spelling of a socket path names the same socket, so it must not slip
+    // past a `--deny-net=unix:<path>` rule.
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_net: Some(svec![]),
+        deny_net: Some(svec!["unix:/run/app/Control.sock"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let mut perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    // Exact spelling is denied.
+    assert!(
+      perms
+        .check_net_unix_socket(Path::new("/run/app/Control.sock"), None)
+        .is_err()
+    );
+
+    // A case-variant spelling resolves to the same socket where the
+    // filesystem is case-insensitive, so it must be denied there too. On
+    // case-sensitive platforms it is a genuinely different path.
+    let case_variant_result = perms
+      .check_net_unix_socket(Path::new("/run/app/control.sock"), None)
+      .is_err();
+    if cfg!(any(target_os = "macos", windows)) {
+      assert!(case_variant_result, "case variant must not bypass the deny");
+    }
+
+    // Allow matching remains exact because macOS also supports case-sensitive
+    // volumes, where the case variant may name a different socket.
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_net: Some(svec!["unix:/run/app/Control.sock"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let mut perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    assert!(
+      perms
+        .check_net_unix_socket(Path::new("/run/app/Control.sock"), None)
+        .is_ok()
+    );
+    assert!(
+      perms
+        .check_net_unix_socket(Path::new("/run/app/control.sock"), None)
+        .is_err()
+    );
+    assert!(
+      perms
+        .check_net_unix_socket(Path::new("/run/app/other.sock"), None)
+        .is_err()
+    );
+  }
+
+  #[test]
+  fn test_empty_descriptor_edge_cases() {
+    let parser = TestPermissionDescriptorParser;
+
+    // Some(vec![]) means "grant all" (global grant)
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(vec![]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(perms.read.is_allow_all());
+
+    // None means "no grant" (prompt mode)
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(!perms.read.is_allow_all());
+    let read_query = parser
+      .parse_path_query(Cow::Owned(PathBuf::from("/foo")))
+      .unwrap()
+      .into_read();
+    assert_eq!(perms.read.query(Some(&read_query)), PermissionState::Prompt);
+
+    // Some(vec![]) for env means "grant all env"
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_env: Some(vec![]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(perms.env.is_allow_all());
+    assert_eq!(perms.env.query(None), PermissionState::Granted);
+
+    // Some(vec![]) for net means "grant all net"
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_net: Some(vec![]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(perms.net.is_allow_all());
+    assert_eq!(perms.net.query(None), PermissionState::Granted);
+  }
+
+  mod proptests {
+    use std::cmp::Ordering;
+    use std::net::Ipv4Addr;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    // -- Strategies --
+
+    fn arb_host() -> impl Strategy<Value = Host> {
+      prop_oneof![
+        any::<[u8; 4]>().prop_map(|b| Host::Ip(IpAddr::V4(Ipv4Addr::new(
+          b[0], b[1], b[2], b[3]
+        )))),
+        "[a-z]{1,5}(\\.[a-z]{1,5}){1,3}".prop_filter_map("valid fqdn", |s| {
+          use std::str::FromStr;
+          fqdn::FQDN::from_str(&s).ok().map(Host::Fqdn)
+        }),
+      ]
+    }
+
+    fn arb_port() -> impl Strategy<Value = Option<u32>> {
+      prop_oneof![Just(None), (1u32..=65535).prop_map(Some),]
+    }
+
+    fn arb_net_descriptor() -> impl Strategy<Value = NetDescriptor> {
+      (arb_host(), arb_port()).prop_map(|(h, p)| NetDescriptor(h, p))
+    }
+
+    fn arb_env_descriptor() -> impl Strategy<Value = EnvDescriptor> {
+      prop_oneof![
+        "[A-Z_]{1,10}"
+          .prop_map(|s| EnvDescriptor::Name(EnvVarName::new(Cow::Owned(s)))),
+        "[A-Z_]{1,10}".prop_map(|s| EnvDescriptor::PrefixPattern(
+          EnvVarName::new(Cow::Owned(s))
+        )),
+      ]
+    }
+
+    fn arb_unary_perm_desc_net()
+    -> impl Strategy<Value = UnaryPermissionDesc<NetDescriptor>> {
+      (arb_net_descriptor(), 0..4u8).prop_map(|(desc, kind)| match kind {
+        0 => UnaryPermissionDesc::Granted(desc),
+        1 => UnaryPermissionDesc::FlagDenied(desc),
+        2 => UnaryPermissionDesc::FlagIgnored(desc),
+        _ => UnaryPermissionDesc::PromptDenied(desc),
+      })
+    }
+
+    fn arb_unary_perm_desc_env()
+    -> impl Strategy<Value = UnaryPermissionDesc<EnvDescriptor>> {
+      (arb_env_descriptor(), 0..4u8).prop_map(|(desc, kind)| match kind {
+        0 => UnaryPermissionDesc::Granted(desc),
+        1 => UnaryPermissionDesc::FlagDenied(desc.clone()),
+        2 => UnaryPermissionDesc::FlagIgnored(desc.clone()),
+        _ => UnaryPermissionDesc::PromptDenied(desc.clone()),
+      })
+    }
+
+    // -- 1. Descriptor ordering invariants --
+
+    // Transitivity: if a <= b and b <= c then a <= c
+    proptest! {
+      #[test]
+      fn net_descriptor_ord_transitivity(
+        a in arb_unary_perm_desc_net(),
+        b in arb_unary_perm_desc_net(),
+        c in arb_unary_perm_desc_net(),
+      ) {
+        let ab = a.cmp(&b);
+        let bc = b.cmp(&c);
+        let ac = a.cmp(&c);
+        if ab != Ordering::Greater && bc != Ordering::Greater {
+          prop_assert_ne!(ac, Ordering::Greater,
+            "transitivity violated: a={:?}, b={:?}, c={:?}", a, b, c);
+        }
+        if ab != Ordering::Less && bc != Ordering::Less {
+          prop_assert_ne!(ac, Ordering::Less,
+            "transitivity violated: a={:?}, b={:?}, c={:?}", a, b, c);
+        }
+      }
+
+      #[test]
+      fn env_descriptor_ord_transitivity(
+        a in arb_unary_perm_desc_env(),
+        b in arb_unary_perm_desc_env(),
+        c in arb_unary_perm_desc_env(),
+      ) {
+        let ab = a.cmp(&b);
+        let bc = b.cmp(&c);
+        let ac = a.cmp(&c);
+        if ab != Ordering::Greater && bc != Ordering::Greater {
+          prop_assert_ne!(ac, Ordering::Greater,
+            "transitivity violated: a={:?}, b={:?}, c={:?}", a, b, c);
+        }
+        if ab != Ordering::Less && bc != Ordering::Less {
+          prop_assert_ne!(ac, Ordering::Less,
+            "transitivity violated: a={:?}, b={:?}, c={:?}", a, b, c);
+        }
+      }
+
+      // Antisymmetry: if a <= b and b <= a then a == b
+      #[test]
+      fn net_descriptor_ord_antisymmetry(
+        a in arb_unary_perm_desc_net(),
+        b in arb_unary_perm_desc_net(),
+      ) {
+        let ab = a.cmp(&b);
+        let ba = b.cmp(&a);
+        match (ab, ba) {
+          (Ordering::Less, Ordering::Less) => {
+            prop_assert!(false, "antisymmetry violated: a < b and b < a, a={:?}, b={:?}", a, b);
+          }
+          (Ordering::Greater, Ordering::Greater) => {
+            prop_assert!(false, "antisymmetry violated: a > b and b > a, a={:?}, b={:?}", a, b);
+          }
+          (Ordering::Equal, other) => {
+            prop_assert_eq!(other, Ordering::Equal,
+              "antisymmetry violated: a == b but b != a, a={:?}, b={:?}", a, b);
+          }
+          (_, Ordering::Equal) => {
+            prop_assert_eq!(ab, Ordering::Equal,
+              "antisymmetry violated: b == a but a != b, a={:?}, b={:?}", a, b);
+          }
+          _ => {} // Less/Greater is fine
+        }
+      }
+
+      // Reflexivity: a == a
+      #[test]
+      fn net_descriptor_ord_reflexivity(
+        a in arb_unary_perm_desc_net(),
+      ) {
+        prop_assert_eq!(a.cmp(&a), Ordering::Equal,
+          "reflexivity violated: a={:?}", a);
+      }
+
+      // Binary search correctness: after inserting into descriptors,
+      // the vec remains sorted
+      #[test]
+      fn net_descriptors_remain_sorted_after_inserts(
+        descs in prop::collection::vec(arb_unary_perm_desc_net(), 1..20),
+      ) {
+        let mut descriptors = UnaryPermissionDescriptors::<NetDescriptor>::default();
+        for d in &descs {
+          descriptors.insert(d.clone());
+        }
+        let inner = &descriptors.inner;
+        for i in 1..inner.len() {
+          prop_assert!(inner[i - 1] <= inner[i],
+            "not sorted at index {}: {:?} > {:?}", i, inner[i-1], inner[i]);
+        }
+      }
+
+      #[test]
+      fn env_descriptors_remain_sorted_after_inserts(
+        descs in prop::collection::vec(arb_unary_perm_desc_env(), 1..20),
+      ) {
+        let mut descriptors = UnaryPermissionDescriptors::<EnvDescriptor>::default();
+        for d in &descs {
+          descriptors.insert(d.clone());
+        }
+        let inner = &descriptors.inner;
+        for i in 1..inner.len() {
+          prop_assert!(inner[i - 1] <= inner[i],
+            "not sorted at index {}: {:?} > {:?}", i, inner[i-1], inner[i]);
+        }
+      }
+    }
+
+    // -- 2. Allow/deny resolution consistency --
+    // query_desc() should never return Granted when a matching FlagDenied
+    // descriptor exists in the list.
+
+    proptest! {
+      #[test]
+      fn net_query_never_granted_when_flag_denied(
+        allow_descs in prop::collection::vec(arb_net_descriptor(), 0..5),
+        deny_descs in prop::collection::vec(arb_net_descriptor(), 1..5),
+        query in arb_net_descriptor(),
+      ) {
+        set_prompter(Box::new(TestPrompter));
+
+        let mut perm = UnaryPermission::<NetDescriptor>::default();
+        for d in &allow_descs {
+          perm.descriptors.insert(UnaryPermissionDesc::Granted(d.clone()));
+        }
+        for d in &deny_descs {
+          perm.descriptors.insert(UnaryPermissionDesc::FlagDenied(d.clone()));
+        }
+
+        // If the query matches any deny descriptor, the result must not be Granted
+        let matches_any_deny = deny_descs.iter().any(|d| query.matches_deny(d));
+        if matches_any_deny {
+          let state = perm.query_desc(
+            Some(&query),
+            AllowPartial::TreatAsPartialGranted,
+          );
+          prop_assert_ne!(state, PermissionState::Granted,
+            "query returned Granted despite matching FlagDenied: query={:?}, deny={:?}", query, deny_descs);
+          prop_assert_ne!(state, PermissionState::GrantedPartial,
+            "query returned GrantedPartial despite matching FlagDenied: query={:?}, deny={:?}", query, deny_descs);
+        }
+      }
+    }
+
+    // -- 3. Path containment symmetry --
+    // For paths: matches_allow(allow) && stronger_than_deny(deny_at_same_path)
+    // should be consistent with containment direction.
+
+    proptest! {
+      #[test]
+      fn path_containment_properties(
+        base_segments in prop::collection::vec("[a-z]{1,5}", 1..5),
+        extra_segments in prop::collection::vec("[a-z]{1,5}", 0..3),
+      ) {
+        let parser = TestPermissionDescriptorParser;
+
+        let base_path = format!("/{}", base_segments.join("/"));
+        let child_path = if extra_segments.is_empty() {
+          base_path.clone()
+        } else {
+          format!("{}/{}", base_path, extra_segments.join("/"))
+        };
+
+        let base_desc = parser.parse_read_descriptor(&base_path).unwrap();
+        let child_allow_desc = parser.parse_read_descriptor(&child_path).unwrap();
+
+        let child_query = parser.parse_path_query(
+          Cow::Owned(PathBuf::from(&child_path)),
+        ).unwrap().into_read();
+        let base_query = parser.parse_path_query(
+          Cow::Owned(PathBuf::from(&base_path)),
+        ).unwrap().into_read();
+
+        // A child path should match_allow on a base (parent) allow descriptor
+        prop_assert!(child_query.matches_allow(&base_desc),
+          "child {} should match_allow base {}", child_path, base_path);
+
+        // A base path should be stronger_than_deny of a child deny
+        prop_assert!(base_query.stronger_than_deny(&child_allow_desc),
+          "base {} should be stronger_than_deny of child {}", base_path, child_path);
+
+        // If child matches allow on base, then child matches deny on base too
+        // (because matches_deny delegates to same containment check for paths)
+        prop_assert!(child_query.matches_deny(&base_desc),
+          "matches_deny should agree with matches_allow for paths");
+
+        // overlaps_deny is same as stronger_than_deny for paths
+        prop_assert_eq!(
+          base_query.overlaps_deny(&child_allow_desc),
+          base_query.stronger_than_deny(&child_allow_desc),
+          "overlaps_deny should agree with stronger_than_deny for paths"
+        );
+      }
+    }
+
+    // -- 4. Child permission escalation --
+    // Child processes should never obtain permissions that the parent's
+    // check() method would deny.
+
+    proptest! {
+      #[test]
+      fn child_net_permissions_cannot_escalate(
+        parent_allow in prop::collection::vec(arb_net_descriptor(), 0..5),
+        parent_deny in prop::collection::vec(arb_net_descriptor(), 0..3),
+        child_request in prop::collection::vec(arb_net_descriptor(), 0..5),
+        query in arb_net_descriptor(),
+      ) {
+        set_prompter(Box::new(TestPrompter));
+        let prompt_value = PERMISSION_PROMPT_STUB_VALUE_SETTER.lock();
+        prompt_value.set(false);
+
+        // Build parent permissions
+        let mut parent = UnaryPermission::<NetDescriptor>::default();
+        for d in &parent_allow {
+          parent.descriptors.insert(UnaryPermissionDesc::Granted(d.clone()));
+        }
+        for d in &parent_deny {
+          parent.descriptors.insert(UnaryPermissionDesc::FlagDenied(d.clone()));
+        }
+
+        // Try to create child permissions with the requested list
+        let child_strs: Vec<String> = child_request.iter().map(|d| d.to_string()).collect();
+        let child_result = parent.create_child_permissions(
+          ChildUnaryPermissionArg::GrantedList(child_strs),
+          |s| NetDescriptor::parse_for_list(s).map(Some),
+        );
+
+        if let Ok(child) = child_result {
+          // For any query: if parent would deny, child must also deny
+          let parent_state = parent.query_desc(
+            Some(&query),
+            AllowPartial::TreatAsDenied,
+          );
+          let child_state = child.query_desc(
+            Some(&query),
+            AllowPartial::TreatAsDenied,
+          );
+
+          if parent_state == PermissionState::Denied {
+            prop_assert_ne!(child_state, PermissionState::Granted,
+              "child escalated! query={:?}, parent_state={:?}, child_state={:?}",
+              query, parent_state, child_state);
+          }
+        }
+        // If child creation failed (Escalation), that's the correct behavior
+      }
+
+      #[test]
+      fn child_inherit_preserves_denials(
+        parent_allow in prop::collection::vec(arb_net_descriptor(), 0..3),
+        parent_deny in prop::collection::vec(arb_net_descriptor(), 1..3),
+        query in arb_net_descriptor(),
+      ) {
+        set_prompter(Box::new(TestPrompter));
+
+        let mut parent = UnaryPermission::<NetDescriptor>::default();
+        for d in &parent_allow {
+          parent.descriptors.insert(UnaryPermissionDesc::Granted(d.clone()));
+        }
+        for d in &parent_deny {
+          parent.descriptors.insert(UnaryPermissionDesc::FlagDenied(d.clone()));
+        }
+
+        let child = parent.create_child_permissions(
+          ChildUnaryPermissionArg::Inherit,
+          |s: &str| NetDescriptor::parse_for_list(s).map(Some),
+        ).unwrap();
+
+        // Inherited child should have identical query results
+        let parent_state = parent.query_desc(Some(&query), AllowPartial::TreatAsDenied);
+        let child_state = child.query_desc(Some(&query), AllowPartial::TreatAsDenied);
+        prop_assert_eq!(parent_state, child_state,
+          "inherited child diverged from parent: query={:?}", query);
+      }
+    }
+
+    // -- 5. Net descriptor round-trip --
+    // Parsing display_name() back through parse should yield an equivalent
+    // descriptor.
+
+    proptest! {
+      #[test]
+      fn net_descriptor_display_roundtrip(
+        desc in arb_net_descriptor(),
+      ) {
+        let display = desc.display_name().to_string();
+        // parse_for_list supports wildcards (superset of parse_for_query)
+        if let Ok(parsed) = NetDescriptor::parse_for_list(&display) {
+          prop_assert_eq!(&parsed, &desc,
+            "round-trip failed: display={:?}, original={:?}, parsed={:?}",
+            display, desc, parsed);
+        }
+        // If parsing fails, skip (some edge cases with subnet display may differ)
+      }
+
+      // Also test with port
+      #[test]
+      fn net_descriptor_display_roundtrip_with_port(
+        host in arb_host(),
+        port in 1u32..=65535,
+      ) {
+        let desc = NetDescriptor(host, Some(port));
+        let display = desc.display_name().to_string();
+        if let Ok(parsed) = NetDescriptor::parse_for_list(&display) {
+          prop_assert_eq!(&parsed, &desc,
+            "round-trip with port failed: display={:?}", display);
+        }
+      }
+    }
+
+    // -- 6. Global flag_denied overrides granted descriptors --
+
+    proptest! {
+      #[test]
+      fn global_deny_overrides_all_grants_net(
+        allow_descs in prop::collection::vec(arb_net_descriptor(), 1..5),
+        query in arb_net_descriptor(),
+      ) {
+        set_prompter(Box::new(TestPrompter));
+
+        let mut perm = UnaryPermission::<NetDescriptor> {
+          flag_denied_global: true,
+          ..Default::default()
+        };
+        for d in &allow_descs {
+          perm.descriptors.insert(UnaryPermissionDesc::Granted(d.clone()));
+        }
+
+        let state = perm.query_desc(Some(&query), AllowPartial::TreatAsDenied);
+        prop_assert_eq!(state, PermissionState::Denied,
+          "flag_denied_global should deny everything: query={:?}", query);
+
+        // Also check global query (None)
+        let state_global = perm.query_desc(None, AllowPartial::TreatAsDenied);
+        prop_assert_eq!(state_global, PermissionState::Denied,
+          "flag_denied_global should deny global query too");
+      }
+
+      #[test]
+      fn global_deny_overrides_granted_global_net(
+        query in arb_net_descriptor(),
+      ) {
+        set_prompter(Box::new(TestPrompter));
+
+        let perm = UnaryPermission::<NetDescriptor> {
+          granted_global: true,
+          flag_denied_global: true,
+          ..Default::default()
+        };
+
+        let state = perm.query_desc(Some(&query), AllowPartial::TreatAsDenied);
+        prop_assert_eq!(state, PermissionState::Denied,
+          "flag_denied_global should override granted_global: query={:?}", query);
+      }
+    }
+
+    // -- 7. Revoke consistency --
+    // After revoke_desc(), query_desc() should never return Granted for
+    // the revoked descriptor.
+
+    proptest! {
+      #[test]
+      fn revoke_prevents_granted_net(
+        allow_descs in prop::collection::vec(arb_net_descriptor(), 1..5),
+        revoke_idx in 0usize..5,
+      ) {
+        set_prompter(Box::new(TestPrompter));
+
+        let mut perm = UnaryPermission::<NetDescriptor>::default();
+        for d in &allow_descs {
+          perm.descriptors.insert(UnaryPermissionDesc::Granted(d.clone()));
+        }
+
+        let idx = revoke_idx % allow_descs.len();
+        let to_revoke = &allow_descs[idx];
+
+        perm.revoke_desc(Some(to_revoke));
+
+        // After revoking, the descriptor should not be Granted
+        let state = perm.query_desc(
+          Some(to_revoke),
+          AllowPartial::TreatAsDenied,
+        );
+        prop_assert_ne!(state, PermissionState::Granted,
+          "revoked descriptor still Granted: {:?}", to_revoke);
+      }
+
+      #[test]
+      fn revoke_global_clears_all_grants_net(
+        allow_descs in prop::collection::vec(arb_net_descriptor(), 1..5),
+        query in arb_net_descriptor(),
+      ) {
+        set_prompter(Box::new(TestPrompter));
+
+        let mut perm = UnaryPermission::<NetDescriptor> {
+          granted_global: true,
+          ..Default::default()
+        };
+        for d in &allow_descs {
+          perm.descriptors.insert(UnaryPermissionDesc::Granted(d.clone()));
+        }
+
+        // Revoke global
+        perm.revoke_desc(None);
+
+        prop_assert!(!perm.granted_global,
+          "granted_global should be false after global revoke");
+
+        // No descriptor should be Granted anymore (should be Prompt)
+        let state = perm.query_desc(Some(&query), AllowPartial::TreatAsDenied);
+        prop_assert_ne!(state, PermissionState::Granted,
+          "query still Granted after global revoke: {:?}", query);
+      }
+    }
+
+    // -- 8. Idempotent insert --
+    // Inserting the same descriptor twice should not change the vec length.
+
+    proptest! {
+      #[test]
+      fn idempotent_insert_net(
+        desc in arb_unary_perm_desc_net(),
+      ) {
+        let mut descriptors = UnaryPermissionDescriptors::<NetDescriptor>::default();
+        descriptors.insert(desc.clone());
+        let len_after_first = descriptors.inner.len();
+
+        descriptors.insert(desc.clone());
+        let len_after_second = descriptors.inner.len();
+
+        prop_assert_eq!(len_after_first, len_after_second,
+          "duplicate insert changed vec length: desc={:?}", desc);
+      }
+
+      #[test]
+      fn idempotent_insert_env(
+        desc in arb_unary_perm_desc_env(),
+      ) {
+        let mut descriptors = UnaryPermissionDescriptors::<EnvDescriptor>::default();
+        descriptors.insert(desc.clone());
+        let len_after_first = descriptors.inner.len();
+
+        descriptors.insert(desc.clone());
+        let len_after_second = descriptors.inner.len();
+
+        prop_assert_eq!(len_after_first, len_after_second,
+          "duplicate insert changed vec length: desc={:?}", desc);
+      }
+    }
+
+    // -- 9. Net matches_allow reflexivity --
+    // Any NetDescriptor should matches_allow itself.
+
+    proptest! {
+      #[test]
+      fn net_matches_allow_reflexive(
+        desc in arb_net_descriptor(),
+      ) {
+        prop_assert!(desc.matches_allow(&desc),
+          "descriptor should match its own allow: {:?}", desc);
+      }
+
+      #[test]
+      fn net_matches_deny_reflexive(
+        desc in arb_net_descriptor(),
+      ) {
+        prop_assert!(desc.matches_deny(&desc),
+          "descriptor should match its own deny: {:?}", desc);
+      }
+
+      #[test]
+      fn net_stronger_than_deny_reflexive(
+        desc in arb_net_descriptor(),
+      ) {
+        prop_assert!(desc.stronger_than_deny(&desc),
+          "descriptor should be stronger_than_deny of itself: {:?}", desc);
+      }
+    }
+
+    // -- 10. Child NotGranted has no grants --
+    // A child created with NotGranted should never return Granted.
+
+    proptest! {
+      #[test]
+      fn child_not_granted_denies_everything_net(
+        parent_allow in prop::collection::vec(arb_net_descriptor(), 1..5),
+        query in arb_net_descriptor(),
+      ) {
+        set_prompter(Box::new(TestPrompter));
+        let prompt_value = PERMISSION_PROMPT_STUB_VALUE_SETTER.lock();
+        prompt_value.set(false);
+
+        let mut parent = UnaryPermission::<NetDescriptor>::default();
+        for d in &parent_allow {
+          parent.descriptors.insert(UnaryPermissionDesc::Granted(d.clone()));
+        }
+
+        let child = parent.create_child_permissions(
+          ChildUnaryPermissionArg::NotGranted,
+          |s: &str| NetDescriptor::parse_for_list(s).map(Some),
+        ).unwrap();
+
+        let state = child.query_desc(Some(&query), AllowPartial::TreatAsDenied);
+        prop_assert_ne!(state, PermissionState::Granted,
+          "NotGranted child returned Granted: query={:?}", query);
+        prop_assert_ne!(state, PermissionState::GrantedPartial,
+          "NotGranted child returned GrantedPartial: query={:?}", query);
+      }
+
+      #[test]
+      fn child_not_granted_global_not_granted_net(
+        parent_allow in prop::collection::vec(arb_net_descriptor(), 0..3),
+      ) {
+        set_prompter(Box::new(TestPrompter));
+        let prompt_value = PERMISSION_PROMPT_STUB_VALUE_SETTER.lock();
+        prompt_value.set(false);
+
+        let mut parent = UnaryPermission::<NetDescriptor> {
+          granted_global: true,
+          ..Default::default()
+        };
+        for d in &parent_allow {
+          parent.descriptors.insert(UnaryPermissionDesc::Granted(d.clone()));
+        }
+
+        let child = parent.create_child_permissions(
+          ChildUnaryPermissionArg::NotGranted,
+          |s: &str| NetDescriptor::parse_for_list(s).map(Some),
+        ).unwrap();
+
+        prop_assert!(!child.granted_global,
+          "NotGranted child should not have granted_global");
+
+        let state = child.query_desc(None, AllowPartial::TreatAsDenied);
+        prop_assert_ne!(state, PermissionState::Granted,
+          "NotGranted child global query returned Granted");
+      }
+    }
   }
 }

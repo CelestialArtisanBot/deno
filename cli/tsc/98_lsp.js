@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 import {
   clearScriptNamesCache,
@@ -25,9 +25,6 @@ import {
 const core = globalThis.Deno.core;
 const ops = core.ops;
 
-/** @type {Map<string, string[]>} */
-const ambientModulesCache = new Map();
-
 const ChangeKind = {
   Opened: 0,
   Modified: 1,
@@ -43,6 +40,22 @@ function getCompilationSettings(settingsOrHost) {
     return settingsOrHost.getCompilationSettings();
   }
   return /** @type {ts.CompilerOptions} */ (settingsOrHost);
+}
+
+/**
+ * Assigns `moduleName` on a source file so that tsc displays the original
+ * module specifier (e.g. in `typeof import("...")`) for non-file URL
+ * specifiers like `https://...`. For `file://` specifiers we leave it
+ * unset so tsc keeps its usual relative-path computation and so internal
+ * details like the `/$node_modules/` rewrite don't leak into hovers.
+ *
+ * @param {ts.SourceFile} sourceFile
+ * @param {string} fileName
+ */
+function setSourceFileModuleNameForDisplay(sourceFile, fileName) {
+  if (!fileName.startsWith("file:")) {
+    sourceFile.moduleName = fileName;
+  }
 }
 
 // We need to use a custom document registry in order to provide source files
@@ -108,6 +121,12 @@ const documentRegistry = {
       if (scriptSnapshot.isClassicScript) {
         sourceFile.externalModuleIndicator = undefined;
       }
+      // Preserve the original module specifier so that `typeof import(...)`
+      // displays the URL exactly as the user wrote it, including extensions.
+      // Without this, tsc's `getSpecifierForModuleSymbol` recomputes the
+      // specifier via `getModuleSpecifiers`, which strips `.ts` from URL
+      // imports like `https://example.com/mod.ts`. See denoland/deno#16058.
+      setSourceFileModuleNameForDisplay(sourceFile, fileName);
       documentRegistrySourceFileCache.set(mapKey, sourceFile);
     }
     const sourceRefCount = SOURCE_REF_COUNTS.get(fileName) ?? 0;
@@ -173,6 +192,7 @@ const documentRegistry = {
       if (scriptSnapshot.isClassicScript) {
         sourceFile.externalModuleIndicator = undefined;
       }
+      setSourceFileModuleNameForDisplay(sourceFile, fileName);
       documentRegistrySourceFileCache.set(mapKey, sourceFile);
     }
     return sourceFile;
@@ -240,8 +260,14 @@ function lspToTsCompilerOptions(config) {
   Object.assign(options, {
     allowNonTsExtensions: true,
     allowImportingTsExtensions: true,
-    module: ts.ModuleKind.NodeNext,
-    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    module: options.module === ts.ModuleKind.ESNext ||
+        options.module === ts.ModuleKind.Preserve
+      ? options.module
+      : ts.ModuleKind.NodeNext,
+    moduleResolution:
+      options.moduleResolution === ts.ModuleResolutionKind.Bundler
+        ? ts.ModuleResolutionKind.Bundler
+        : ts.ModuleResolutionKind.NodeNext,
   });
   if (errors.length > 0) {
     debug(ts.formatDiagnostics(errors, host));
@@ -317,10 +343,26 @@ function createLs() {
   return ls;
 }
 
+/**
+ * Prompt V8 to collect garbage and hand memory back to the OS. Triggered by
+ * `op_poll_requests` after the language server has been idle, so a long-running
+ * editor session doesn't keep sitting on the (often large) transient heap left
+ * over from the last batch of type-checking until something else forces a
+ * collection. See denoland/deno#23577.
+ *
+ * Note we deliberately don't drop the language services' semantic caches here:
+ * `cleanupSemanticCache()` discards the current program without bumping the
+ * project version, so the language service would consider itself up to date and
+ * never rebuild it, breaking the next request. It's only safe to call paired
+ * with a project change (see `$cleanupSemanticCache`). A full GC reclaims the
+ * dead allocations without touching the still-valid live program.
+ */
+function releaseMemory() {
+  ops.op_lsp_release_memory();
+}
+
 /** @param {boolean} enableDebugLogging */
 export async function serverMainLoop(enableDebugLogging) {
-  ts.deno.setEnterSpan(ops.op_make_span);
-  ts.deno.setExitSpan(ops.op_exit_span);
   if (hasStarted) {
     throw new Error("The language server has already been initialized.");
   }
@@ -332,6 +374,17 @@ export async function serverMainLoop(enableDebugLogging) {
     const request = await pollRequests();
     if (request === null) {
       break;
+    }
+    // Synthesized by `op_poll_requests` when the server has gone idle. Handled
+    // here rather than through `serverRequest()` because there's no client
+    // waiting on a response.
+    if (request[1] === "$releaseMemory") {
+      try {
+        releaseMemory();
+      } catch (err) {
+        error(`Internal error occurred during idle memory release: ${err}`);
+      }
+      continue;
     }
     try {
       serverRequest(
@@ -362,28 +415,6 @@ function formatErrorWithArgs(error, args) {
     }]`;
   }
   return errorString;
-}
-
-/**
- * @param {string[]} a
- * @param {string[]} b
- */
-function arraysEqual(a, b) {
-  if (a === b) {
-    return true;
-  }
-  if (a === null || b === null) {
-    return false;
-  }
-  if (a.length !== b.length) {
-    return false;
-  }
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) {
-      return false;
-    }
-  }
-  return true;
 }
 
 /**
@@ -534,28 +565,14 @@ function serverRequestInner(
         return respond(id, [[], null]);
       }
       try {
-        /** @type {any[][]} */
-        const diagnosticsList = [];
-        for (const specifier of args[0]) {
-          diagnosticsList.push(fromTypeScriptDiagnostics([
-            ...ls.getSemanticDiagnostics(specifier),
-            ...ls.getSuggestionDiagnostics(specifier),
-            ...ls.getSyntacticDiagnostics(specifier),
-          ].filter(filterMapDiagnostic)));
-        }
-        let ambient =
-          ls.getProgram()?.getTypeChecker().getAmbientModules().map((symbol) =>
-            symbol.getName()
-          ) ?? [];
-        const previousAmbient = ambientModulesCache.get(compilerOptionsKey);
-        if (
-          ambient && previousAmbient && arraysEqual(ambient, previousAmbient)
-        ) {
-          ambient = null; // null => use previous value
-        } else {
-          ambientModulesCache.set(compilerOptionsKey, ambient);
-        }
-        return respond(id, [diagnosticsList, ambient]);
+        /** @type {string} */
+        const specifier = args[0];
+        const diagnostics = fromTypeScriptDiagnostics([
+          ...ls.getSemanticDiagnostics(specifier),
+          ...ls.getSuggestionDiagnostics(specifier),
+          ...ls.getSyntacticDiagnostics(specifier),
+        ].filter(filterMapDiagnostic));
+        return respond(id, diagnostics);
       } catch (e) {
         if (
           !isCancellationError(e)
@@ -575,6 +592,14 @@ function serverRequestInner(
         }
         return respond(id, [[], null]);
       }
+    }
+    case "$getAmbientModules": {
+      return respond(
+        id,
+        ls.getProgram()?.getTypeChecker().getAmbientModules().map((symbol) =>
+          symbol.getName()
+        ) ?? [],
+      );
     }
     default:
       if (typeof ls[method] === "function") {

@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 // deno-lint-ignore-file no-explicit-any no-var
 
@@ -85,7 +85,8 @@ interface CloseEvent extends Event {
  * @see https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent/CloseEvent
  * @category WebSockets
  */
-declare var CloseEvent: {
+declare var CloseEvent: typeof globalThis extends
+  { document: any; CloseEvent: infer T } ? T : {
   readonly prototype: CloseEvent;
   new (type: string, eventInitDict?: CloseEventInit): CloseEvent;
 };
@@ -267,19 +268,66 @@ interface WebSocket extends EventTarget {
  * // Using URL object instead of string
  * const url = new URL("ws://localhost:8080/path");
  * const wsWithUrl = new WebSocket(url);
+ *
+ * // WebSocket with headers
+ * const wsWithProtocols = new WebSocket("ws://localhost:8080", {
+ *   headers: {
+ *     "Authorization": "Bearer foo",
+ *   },
+ * });
  * ```
  *
  * @see https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/WebSocket
  * @category WebSockets
  */
-declare var WebSocket: {
+declare var WebSocket: typeof globalThis extends
+  { document: any; WebSocket: infer T } ? T : {
   readonly prototype: WebSocket;
-  new (url: string | URL, protocols?: string | string[]): WebSocket;
+  new (
+    url: string | URL,
+    protocolsOrOptions?: string | string[] | WebSocketOptions,
+  ): WebSocket;
   readonly CLOSED: number;
   readonly CLOSING: number;
   readonly CONNECTING: number;
   readonly OPEN: number;
 };
+
+/**
+ * Options for a WebSocket instance.
+ * This feature is non-standard.
+ *
+ * @category WebSockets
+ */
+interface WebSocketOptions {
+  /**
+   * The sub-protocol(s) that the client would like to use, in order of preference.
+   */
+  protocols?: string | string[];
+  /**
+   * A Headers object, an object literal, or an array of two-item arrays to set handshake's headers.
+   * This feature is non-standard.
+   */
+  headers?: HeadersInit;
+  /**
+   * An `HttpClient` instance to use when creating the WebSocket connection.
+   * This is useful when you need to connect through a proxy or customize TLS settings.
+   *
+   * ```ts
+   * const client = Deno.createHttpClient({
+   *   proxy: {
+   *     transport: "unix",
+   *     path: "/path/to/socket",
+   *   },
+   * });
+   *
+   * const ws = new WebSocket("ws://localhost:8000/socket", { client });
+   * ```
+   *
+   * @experimental
+   */
+  client?: Deno.HttpClient;
+}
 
 /**
  * Specifies the type of binary data being received over a `WebSocket` connection.

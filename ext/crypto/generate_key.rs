@@ -1,17 +1,14 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use aws_lc_rs::rand::SecureRandom;
 use aws_lc_rs::signature::EcdsaKeyPair;
-use deno_core::ToJsBuffer;
-use deno_core::op2;
-use deno_core::unsync::spawn_blocking;
+use elliptic_curve::pkcs8::EncodePrivateKey;
 use elliptic_curve::rand_core::OsRng;
 use num_traits::FromPrimitive;
 use once_cell::sync::Lazy;
 use rsa::BigUint;
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::EncodeRsaPrivateKey;
-use serde::Deserialize;
 
 use crate::shared::*;
 
@@ -39,6 +36,8 @@ pub enum GenerateKeyError {
   FailedECKeyGeneration,
   #[error("Failed to generate key")]
   FailedKeyGeneration,
+  #[error("Unsupported algorithm")]
+  UnsupportedAlgorithm,
 }
 
 // Allowlist for RSA public exponents.
@@ -47,44 +46,33 @@ static PUB_EXPONENT_1: Lazy<BigUint> =
 static PUB_EXPONENT_2: Lazy<BigUint> =
   Lazy::new(|| BigUint::from_u64(65537).unwrap());
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", tag = "algorithm")]
-pub enum GenerateKeyOptions {
-  #[serde(rename = "RSA", rename_all = "camelCase")]
-  Rsa {
-    modulus_length: u32,
-    #[serde(with = "serde_bytes")]
-    public_exponent: Vec<u8>,
-  },
-  #[serde(rename = "EC", rename_all = "camelCase")]
-  Ec { named_curve: EcNamedCurve },
-  #[serde(rename = "AES", rename_all = "camelCase")]
-  Aes { length: usize },
-  #[serde(rename = "HMAC", rename_all = "camelCase")]
-  Hmac {
-    hash: ShaHash,
-    length: Option<usize>,
-  },
+/// Rust-callable view of the RSA keygen path. Returns raw PKCS#1 DER
+/// bytes ready to feed [`crate::shared::RawKeyData::Private`].
+pub fn generate_rsa(
+  modulus_length: u32,
+  public_exponent: &[u8],
+) -> Result<Vec<u8>, GenerateKeyError> {
+  generate_key_rsa(modulus_length, public_exponent)
 }
 
-#[op2(async)]
-#[serde]
-pub async fn op_crypto_generate_key(
-  #[serde] opts: GenerateKeyOptions,
-) -> Result<ToJsBuffer, GenerateKeyError> {
-  let fun = || match opts {
-    GenerateKeyOptions::Rsa {
-      modulus_length,
-      public_exponent,
-    } => generate_key_rsa(modulus_length, &public_exponent),
-    GenerateKeyOptions::Ec { named_curve } => generate_key_ec(named_curve),
-    GenerateKeyOptions::Aes { length } => generate_key_aes(length),
-    GenerateKeyOptions::Hmac { hash, length } => {
-      generate_key_hmac(hash, length)
-    }
-  };
-  let buf = spawn_blocking(fun).await.unwrap()?;
-  Ok(buf.into())
+/// Rust-callable EC keygen.
+pub fn generate_ec(
+  named_curve: EcNamedCurve,
+) -> Result<Vec<u8>, GenerateKeyError> {
+  generate_key_ec(named_curve)
+}
+
+/// Rust-callable AES keygen.
+pub fn generate_aes(length: usize) -> Result<Vec<u8>, GenerateKeyError> {
+  generate_key_aes(length)
+}
+
+/// Rust-callable HMAC keygen.
+pub fn generate_hmac(
+  hash: ShaHash,
+  length: Option<usize>,
+) -> Result<Vec<u8>, GenerateKeyError> {
+  generate_key_hmac(hash, length)
 }
 
 fn generate_key_rsa(
@@ -109,10 +97,13 @@ fn generate_key_rsa(
   Ok(private_key.as_bytes().to_vec())
 }
 
-fn generate_key_ec_p521() -> Vec<u8> {
+fn generate_key_ec_p521() -> Result<Vec<u8>, GenerateKeyError> {
   let mut rng = OsRng;
   let key = p521::SecretKey::random(&mut rng);
-  key.to_nonzero_scalar().to_bytes().to_vec()
+  let pkcs8 = key
+    .to_pkcs8_der()
+    .map_err(|_| GenerateKeyError::FailedECKeyGeneration)?;
+  Ok(pkcs8.as_bytes().to_vec())
 }
 
 fn generate_key_ec(
@@ -125,7 +116,7 @@ fn generate_key_ec(
     EcNamedCurve::P384 => {
       &aws_lc_rs::signature::ECDSA_P384_SHA384_FIXED_SIGNING
     }
-    EcNamedCurve::P521 => return Ok(generate_key_ec_p521()),
+    EcNamedCurve::P521 => return generate_key_ec_p521(),
   };
 
   let rng = aws_lc_rs::rand::SystemRandom::new();
@@ -137,7 +128,7 @@ fn generate_key_ec(
 }
 
 fn generate_key_aes(length: usize) -> Result<Vec<u8>, GenerateKeyError> {
-  if length % 8 != 0 || length > 256 {
+  if !length.is_multiple_of(8) || length > 256 {
     return Err(GenerateKeyError::InvalidAESKeyLength);
   }
 
@@ -154,11 +145,26 @@ fn generate_key_hmac(
   hash: ShaHash,
   length: Option<usize>,
 ) -> Result<Vec<u8>, GenerateKeyError> {
-  let hash = match hash {
-    ShaHash::Sha1 => &aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-    ShaHash::Sha256 => &aws_lc_rs::hmac::HMAC_SHA256,
-    ShaHash::Sha384 => &aws_lc_rs::hmac::HMAC_SHA384,
-    ShaHash::Sha512 => &aws_lc_rs::hmac::HMAC_SHA512,
+  // Default key length (in bytes) is the hash's block size.
+  // SHA-3 is not supported by aws-lc-rs for HMAC, so the block sizes are
+  // hard-coded here per FIPS 202.
+  let default_block_len = match hash {
+    ShaHash::Sha1 => aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY
+      .digest_algorithm()
+      .block_len(),
+    ShaHash::Sha256 => {
+      aws_lc_rs::hmac::HMAC_SHA256.digest_algorithm().block_len()
+    }
+    ShaHash::Sha384 => {
+      aws_lc_rs::hmac::HMAC_SHA384.digest_algorithm().block_len()
+    }
+    ShaHash::Sha512 => {
+      aws_lc_rs::hmac::HMAC_SHA512.digest_algorithm().block_len()
+    }
+    // FIPS 202: rate (r) in bytes for SHA3-N is (1600 - 2N) / 8.
+    ShaHash::Sha3_256 => 136,
+    ShaHash::Sha3_384 => 104,
+    ShaHash::Sha3_512 => 72,
   };
 
   let length = if let Some(length) = length {
@@ -173,7 +179,7 @@ fn generate_key_hmac(
 
     length
   } else {
-    hash.digest_algorithm().block_len()
+    default_block_len
   };
 
   let rng = aws_lc_rs::rand::SystemRandom::new();

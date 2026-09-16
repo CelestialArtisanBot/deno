@@ -1,11 +1,15 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 //! Parts of this module should be able to be replaced with other crates
 //! eventually, once generic versions appear in hyper-util, et al.
 
+#[cfg(not(windows))]
+use std::borrow::Cow;
 use std::env;
 use std::future::Future;
 use std::net::IpAddr;
+#[cfg(not(windows))]
+use std::path::Path;
 #[cfg(not(windows))]
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -14,6 +18,9 @@ use std::task::Context;
 use std::task::Poll;
 
 use deno_core::futures::TryFutureExt;
+#[cfg(not(windows))]
+use deno_permissions::OpenAccessKind;
+use deno_permissions::PermissionsContainer;
 use deno_tls::rustls::ClientConfig as TlsConfig;
 use http::Uri;
 use http::header::HeaderValue;
@@ -31,9 +38,15 @@ use tokio::net::UnixStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_socks::tcp::Socks5Stream;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+  target_os = "android",
+  target_os = "linux",
+  target_os = "macos"
+))]
 use tokio_vsock::VsockStream;
 use tower_service::Service;
+
+use crate::dns::CheckDst;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProxyConnector<C> {
@@ -45,6 +58,47 @@ pub(crate) struct ProxyConnector<C> {
   /// Notably, does not include ALPN
   pub(crate) tls_proxy: Arc<TlsConfig>,
   pub(crate) user_agent: Option<HeaderValue>,
+  pub(crate) permissions: Option<PermissionsContainer>,
+}
+
+impl<C> ProxyConnector<C> {
+  pub(crate) fn h1_only(self) -> Option<ProxyConnector<C>>
+  where
+    C: Service<Uri>,
+  {
+    if !self.tls.alpn_protocols.is_empty() {
+      self.tls.alpn_protocols.iter().find(|p| *p == b"http/1.1")?;
+    }
+    let mut tls = (*self.tls).clone();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Some(ProxyConnector {
+      http: self.http,
+      proxies: self.proxies,
+      tls: Arc::new(tls),
+      tls_proxy: self.tls_proxy,
+      user_agent: self.user_agent,
+      permissions: self.permissions,
+    })
+  }
+
+  pub(crate) fn h2_only(self) -> Option<ProxyConnector<C>>
+  where
+    C: Service<Uri>,
+  {
+    if !self.tls.alpn_protocols.is_empty() {
+      self.tls.alpn_protocols.iter().find(|p| *p == b"h2")?;
+    }
+    let mut tls = (*self.tls).clone();
+    tls.alpn_protocols = vec![b"h2".to_vec()];
+    Some(ProxyConnector {
+      http: self.http,
+      proxies: self.proxies,
+      tls: Arc::new(tls),
+      tls_proxy: self.tls_proxy,
+      user_agent: self.user_agent,
+      permissions: self.permissions,
+    })
+  }
 }
 
 #[derive(Debug)]
@@ -73,11 +127,15 @@ pub(crate) enum Target {
     dst: Uri,
     auth: Option<(String, String)>,
   },
+  Tcp {
+    hostname: String,
+    port: u16,
+  },
   #[cfg(not(windows))]
   Unix {
     path: PathBuf,
   },
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
   Vsock {
     cid: u32,
     port: u32,
@@ -181,11 +239,18 @@ impl Intercept {
       Target::Socks { ref mut auth, .. } => {
         *auth = Some((user.into(), pass.into()));
       }
+      Target::Tcp { .. } => {
+        // Auth not supported for Tcp sockets
+      }
       #[cfg(not(windows))]
       Target::Unix { .. } => {
         // Auth not supported for Unix sockets
       }
-      #[cfg(any(target_os = "linux", target_os = "macos"))]
+      #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos"
+      ))]
       Target::Vsock { .. } => {
         // Auth not supported for Vsock sockets
       }
@@ -203,6 +268,26 @@ impl std::fmt::Debug for Intercept {
 
 impl Target {
   pub(crate) fn parse(val: &str) -> Option<Self> {
+    // unix:<path> is valid RFC3986 but not as an http::Uri
+    #[cfg(not(windows))]
+    if let Some(encoded_path) = val.strip_prefix("unix:") {
+      use std::os::unix::ffi::OsStringExt;
+      let decoded = std::ffi::OsString::from_vec(
+        percent_decode_str(encoded_path).collect::<Vec<u8>>(),
+      );
+      return Some(Target::Unix {
+        path: decoded.into(),
+      });
+    }
+    // vsock:<cid>:<port> is valid RFC3986 but not as an http::Uri
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(cid_port) = val.strip_prefix("vsock:") {
+      let (left, right) = cid_port.split_once(":")?;
+      let cid = left.parse::<u32>().ok()?;
+      let port = right.parse::<u32>().ok()?;
+      return Some(Target::Vsock { cid, port });
+    }
+
     let uri = val.parse::<Uri>().ok()?;
 
     let mut builder = Uri::builder();
@@ -267,12 +352,16 @@ impl Target {
     Some(target)
   }
 
+  pub(crate) fn new_tcp(hostname: String, port: u16) -> Self {
+    Target::Tcp { hostname, port }
+  }
+
   #[cfg(not(windows))]
   pub(crate) fn new_unix(path: PathBuf) -> Self {
     Target::Unix { path }
   }
 
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
   pub(crate) fn new_vsock(cid: u32, port: u32) -> Self {
     Target::Vsock { cid, port }
   }
@@ -440,10 +529,10 @@ impl Proxies {
   }
 
   fn intercept(&self, dst: &Uri) -> Option<&Intercept> {
-    if let Some(no_proxy) = self.no.as_ref() {
-      if no_proxy.contains(dst.host()?) {
-        return None;
-      }
+    if let Some(no_proxy) = self.no.as_ref()
+      && no_proxy.contains(dst.host()?)
+    {
+      return None;
     }
 
     for intercept in &self.intercepts {
@@ -464,13 +553,13 @@ impl Proxies {
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-// These variatns are not to be inspected.
-#[allow(clippy::large_enum_variant)]
+// These variants are not to be inspected.
+#[allow(clippy::large_enum_variant, reason = "TODO: investigate")]
 pub enum Proxied<T> {
   /// Not proxied
   PassThrough(T),
-  /// An HTTP forwarding proxy needed absolute-form
-  HttpForward(T),
+  /// Forwarded via TCP socket
+  Tcp(T),
   /// Tunneled through HTTP CONNECT
   HttpTunneled(Box<TokioIo<TlsStream<TokioIo<T>>>>),
   /// Tunneled through SOCKS
@@ -481,13 +570,13 @@ pub enum Proxied<T> {
   #[cfg(not(windows))]
   Unix(TokioIo<UnixStream>),
   /// Forwarded via Vsock socket
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
   Vsock(TokioIo<VsockStream>),
 }
 
 impl<C> Service<Uri> for ProxyConnector<C>
 where
-  C: Service<Uri> + Clone,
+  C: Service<Uri> + Clone + CheckDst,
   C::Response:
     hyper::rt::Read + hyper::rt::Write + Connection + Unpin + Send + 'static,
   C::Future: Send + 'static,
@@ -508,7 +597,12 @@ where
     if let Some(intercept) = self.intercept(&orig_dst).cloned() {
       let is_https = orig_dst.scheme() == Some(&Scheme::HTTPS);
       let user_agent = self.user_agent.clone();
-      return match intercept.target {
+      // The connect below opens a socket to the *proxy*, so the connector's
+      // own net-deny check only sees the proxy address. Run a best-effort
+      // check against the real destination too, so an IP-level `--deny-net`
+      // rule still applies to requests routed through a proxy.
+      let check_dst = self.http.check_dst(orig_dst.clone());
+      let proxying: Self::Future = match intercept.target {
         Target::Http {
           dst: proxy_dst,
           auth,
@@ -526,16 +620,18 @@ where
 
             if is_https {
               tunnel(&mut io, &orig_dst, user_agent, auth).await?;
+              let host = orig_dst.host().unwrap();
+              let host = host
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(host);
               let tokio_io = TokioIo::new(io);
               let io = tls
-                .connect(
-                  TryFrom::try_from(orig_dst.host().unwrap().to_owned())?,
-                  tokio_io,
-                )
+                .connect(TryFrom::try_from(host.to_owned())?, tokio_io)
                 .await?;
               Ok(Proxied::HttpTunneled(Box::new(TokioIo::new(io))))
             } else {
-              Ok(Proxied::HttpForward(io))
+              Ok(Proxied::Tcp(io))
             }
           })
         }
@@ -544,12 +640,23 @@ where
           auth,
         } => {
           let tls = TlsConnector::from(self.tls.clone());
+          let mut permissions = self.permissions.clone();
           Box::pin(async move {
             let socks_addr = (
               proxy_dst.host().unwrap(),
               proxy_dst.port().map(|p| p.as_u16()).unwrap_or(1080),
             );
+            if let Some(permissions) = permissions.as_mut() {
+              permissions.check_net(
+                &(socks_addr.0, Some(socks_addr.1)),
+                "fetch() proxy",
+              )?;
+            }
             let host = orig_dst.host().ok_or("no host in url")?;
+            let host = host
+              .strip_prefix('[')
+              .and_then(|s| s.strip_suffix(']'))
+              .unwrap_or(host);
             let port = match orig_dst.port() {
               Some(p) => p.as_u16(),
               None if is_https => 443,
@@ -579,21 +686,65 @@ where
             }
           })
         }
+        Target::Tcp {
+          hostname: host,
+          port,
+        } => {
+          let mut connector =
+            HttpsConnector::from((self.http.clone(), self.tls_proxy.clone()));
+          let Ok(uri) = format!("http://{}:{}", host, port).parse() else {
+            return Box::pin(async {
+              Err("failed to parse tcp proxy uri".into())
+            });
+          };
+          let connecting = connector.call(uri);
+          Box::pin(async move {
+            let io = connecting.await?;
+            Ok(Proxied::Tcp(io))
+          })
+        }
         #[cfg(not(windows))]
         Target::Unix { path } => {
-          let path = path.clone();
+          let mut path = path.clone();
+          let mut permissions = self.permissions.clone();
           Box::pin(async move {
+            if let Some(permissions) = permissions.as_mut() {
+              let resolved_path = permissions
+                .check_open(
+                  Cow::Borrowed(Path::new(&path)),
+                  OpenAccessKind::ReadWriteNoFollow,
+                  Some("fetch() proxy"),
+                )?
+                .into_path();
+              permissions
+                .check_net_unix_socket(&resolved_path, Some("fetch() proxy"))?;
+              path = resolved_path.into_owned();
+            }
             let io = UnixStream::connect(&path).await?;
             Ok(Proxied::Unix(TokioIo::new(io)))
           })
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        Target::Vsock { cid, port } => Box::pin(async move {
-          let addr = tokio_vsock::VsockAddr::new(cid, port);
-          let io = VsockStream::connect(addr).await?;
-          Ok(Proxied::Vsock(TokioIo::new(io)))
-        }),
+        #[cfg(any(
+          target_os = "android",
+          target_os = "linux",
+          target_os = "macos"
+        ))]
+        Target::Vsock { cid, port } => {
+          let mut permissions = self.permissions.clone();
+          Box::pin(async move {
+            if let Some(permissions) = permissions.as_mut() {
+              permissions.check_net_vsock(cid, port, "fetch() proxy")?;
+            }
+            let addr = tokio_vsock::VsockAddr::new(cid, port);
+            let io = VsockStream::connect(addr).await?;
+            Ok(Proxied::Vsock(TokioIo::new(io)))
+          })
+        }
       };
+      return Box::pin(async move {
+        check_dst.await?;
+        proxying.await
+      });
     }
 
     let mut connector =
@@ -698,13 +849,17 @@ where
   ) -> Poll<Result<(), std::io::Error>> {
     match *self {
       Proxied::PassThrough(ref mut p) => Pin::new(p).poll_read(cx, buf),
-      Proxied::HttpForward(ref mut p) => Pin::new(p).poll_read(cx, buf),
+      Proxied::Tcp(ref mut p) => Pin::new(p).poll_read(cx, buf),
       Proxied::HttpTunneled(ref mut p) => Pin::new(p).poll_read(cx, buf),
       Proxied::Socks(ref mut p) => Pin::new(p).poll_read(cx, buf),
       Proxied::SocksTls(ref mut p) => Pin::new(p).poll_read(cx, buf),
       #[cfg(not(windows))]
       Proxied::Unix(ref mut p) => Pin::new(p).poll_read(cx, buf),
-      #[cfg(any(target_os = "linux", target_os = "macos"))]
+      #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos"
+      ))]
       Proxied::Vsock(ref mut p) => Pin::new(p).poll_read(cx, buf),
     }
   }
@@ -721,13 +876,17 @@ where
   ) -> Poll<Result<usize, std::io::Error>> {
     match *self {
       Proxied::PassThrough(ref mut p) => Pin::new(p).poll_write(cx, buf),
-      Proxied::HttpForward(ref mut p) => Pin::new(p).poll_write(cx, buf),
+      Proxied::Tcp(ref mut p) => Pin::new(p).poll_write(cx, buf),
       Proxied::HttpTunneled(ref mut p) => Pin::new(p).poll_write(cx, buf),
       Proxied::Socks(ref mut p) => Pin::new(p).poll_write(cx, buf),
       Proxied::SocksTls(ref mut p) => Pin::new(p).poll_write(cx, buf),
       #[cfg(not(windows))]
       Proxied::Unix(ref mut p) => Pin::new(p).poll_write(cx, buf),
-      #[cfg(any(target_os = "linux", target_os = "macos"))]
+      #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos"
+      ))]
       Proxied::Vsock(ref mut p) => Pin::new(p).poll_write(cx, buf),
     }
   }
@@ -738,13 +897,17 @@ where
   ) -> Poll<Result<(), std::io::Error>> {
     match *self {
       Proxied::PassThrough(ref mut p) => Pin::new(p).poll_flush(cx),
-      Proxied::HttpForward(ref mut p) => Pin::new(p).poll_flush(cx),
+      Proxied::Tcp(ref mut p) => Pin::new(p).poll_flush(cx),
       Proxied::HttpTunneled(ref mut p) => Pin::new(p).poll_flush(cx),
       Proxied::Socks(ref mut p) => Pin::new(p).poll_flush(cx),
       Proxied::SocksTls(ref mut p) => Pin::new(p).poll_flush(cx),
       #[cfg(not(windows))]
       Proxied::Unix(ref mut p) => Pin::new(p).poll_flush(cx),
-      #[cfg(any(target_os = "linux", target_os = "macos"))]
+      #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos"
+      ))]
       Proxied::Vsock(ref mut p) => Pin::new(p).poll_flush(cx),
     }
   }
@@ -755,13 +918,17 @@ where
   ) -> Poll<Result<(), std::io::Error>> {
     match *self {
       Proxied::PassThrough(ref mut p) => Pin::new(p).poll_shutdown(cx),
-      Proxied::HttpForward(ref mut p) => Pin::new(p).poll_shutdown(cx),
+      Proxied::Tcp(ref mut p) => Pin::new(p).poll_shutdown(cx),
       Proxied::HttpTunneled(ref mut p) => Pin::new(p).poll_shutdown(cx),
       Proxied::Socks(ref mut p) => Pin::new(p).poll_shutdown(cx),
       Proxied::SocksTls(ref mut p) => Pin::new(p).poll_shutdown(cx),
       #[cfg(not(windows))]
       Proxied::Unix(ref mut p) => Pin::new(p).poll_shutdown(cx),
-      #[cfg(any(target_os = "linux", target_os = "macos"))]
+      #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos"
+      ))]
       Proxied::Vsock(ref mut p) => Pin::new(p).poll_shutdown(cx),
     }
   }
@@ -769,13 +936,17 @@ where
   fn is_write_vectored(&self) -> bool {
     match *self {
       Proxied::PassThrough(ref p) => p.is_write_vectored(),
-      Proxied::HttpForward(ref p) => p.is_write_vectored(),
+      Proxied::Tcp(ref p) => p.is_write_vectored(),
       Proxied::HttpTunneled(ref p) => p.is_write_vectored(),
       Proxied::Socks(ref p) => p.is_write_vectored(),
       Proxied::SocksTls(ref p) => p.is_write_vectored(),
       #[cfg(not(windows))]
       Proxied::Unix(ref p) => p.is_write_vectored(),
-      #[cfg(any(target_os = "linux", target_os = "macos"))]
+      #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos"
+      ))]
       Proxied::Vsock(ref p) => p.is_write_vectored(),
     }
   }
@@ -789,9 +960,7 @@ where
       Proxied::PassThrough(ref mut p) => {
         Pin::new(p).poll_write_vectored(cx, bufs)
       }
-      Proxied::HttpForward(ref mut p) => {
-        Pin::new(p).poll_write_vectored(cx, bufs)
-      }
+      Proxied::Tcp(ref mut p) => Pin::new(p).poll_write_vectored(cx, bufs),
       Proxied::HttpTunneled(ref mut p) => {
         Pin::new(p).poll_write_vectored(cx, bufs)
       }
@@ -799,7 +968,11 @@ where
       Proxied::SocksTls(ref mut p) => Pin::new(p).poll_write_vectored(cx, bufs),
       #[cfg(not(windows))]
       Proxied::Unix(ref mut p) => Pin::new(p).poll_write_vectored(cx, bufs),
-      #[cfg(any(target_os = "linux", target_os = "macos"))]
+      #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos"
+      ))]
       Proxied::Vsock(ref mut p) => Pin::new(p).poll_write_vectored(cx, bufs),
     }
   }
@@ -812,7 +985,7 @@ where
   fn connected(&self) -> Connected {
     match self {
       Proxied::PassThrough(p) => p.connected(),
-      Proxied::HttpForward(p) => p.connected().proxy(true),
+      Proxied::Tcp(p) => p.connected().proxy(true),
       Proxied::HttpTunneled(p) => {
         let tunneled_tls = p.inner().get_ref();
         if tunneled_tls.1.alpn_protocol() == Some(b"h2") {
@@ -831,9 +1004,13 @@ where
         }
       }
       #[cfg(not(windows))]
-      Proxied::Unix(_) => Connected::new(),
-      #[cfg(any(target_os = "linux", target_os = "macos"))]
-      Proxied::Vsock(_) => Connected::new(),
+      Proxied::Unix(_) => Connected::new().proxy(true),
+      #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos"
+      ))]
+      Proxied::Vsock(_) => Connected::new().proxy(true),
     }
   }
 }
@@ -896,6 +1073,25 @@ fn test_proxy_parse_from_env() {
     Target::Socks { dst, auth } => {
       assert_eq!(dst, "socks5h://localhost:6666");
       assert!(auth.is_none());
+    }
+    _ => panic!("bad target"),
+  }
+
+  // unix
+  #[cfg(not(windows))]
+  match parse("unix:foo%20bar/baz") {
+    Target::Unix { path } => {
+      assert_eq!(path.to_str(), Some("foo bar/baz"));
+    }
+    _ => panic!("bad target"),
+  }
+
+  // vsock
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  match parse("vsock:1234:5678") {
+    Target::Vsock { cid, port } => {
+      assert_eq!(cid, 1234);
+      assert_eq!(port, 5678);
     }
     _ => panic!("bad target"),
   }

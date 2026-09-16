@@ -1,8 +1,9 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::borrow::Cow;
 use std::ops::AddAssign;
 
+use console_static_text::ansi::strip_ansi_codes;
 use deno_core::stats::RuntimeActivity;
 use deno_core::stats::RuntimeActivityDiff;
 use deno_core::stats::RuntimeActivityTrace;
@@ -17,13 +18,13 @@ pub fn to_relative_path_or_remote_url(cwd: &Url, path_or_url: &str) -> String {
   let Ok(url) = Url::parse(path_or_url) else {
     return "<anonymous>".to_string();
   };
-  if url.scheme() == "file" {
-    if let Some(mut r) = cwd.make_relative(&url) {
-      if !r.starts_with("../") {
-        r = format!("./{r}");
-      }
-      return to_percent_decoded_str(&r);
+  if url.scheme() == "file"
+    && let Some(mut r) = cwd.make_relative(&url)
+  {
+    if !r.starts_with("../") {
+      r = format!("./{r}");
     }
+    return to_percent_decoded_str(&r);
   }
   path_or_url.to_string()
 }
@@ -88,10 +89,16 @@ pub fn format_test_error(
     .exception_message
     .trim_start_matches("Uncaught ")
     .to_string();
-  if options.hide_stacktraces {
-    return js_error.exception_message;
+  let message = if options.hide_stacktraces {
+    js_error.exception_message
+  } else {
+    format_js_error(&js_error, options.initial_cwd.as_ref())
+  };
+  if options.strip_ascii_color {
+    strip_ansi_codes(&message).to_string()
+  } else {
+    message
   }
-  format_js_error(&js_error)
 }
 
 pub fn format_sanitizer_diff(
@@ -346,13 +353,6 @@ pub const OP_DETAILS: phf::Map<&'static str, [&'static str; 2]> = phf_map! {
   "op_blob_read_part" => ["read from a Blob or File", "awaiting the result of a Blob or File read"],
   "op_broadcast_recv" => ["receive a message from a BroadcastChannel", "closing the BroadcastChannel"],
   "op_broadcast_send" => ["send a message to a BroadcastChannel", "closing the BroadcastChannel"],
-  "op_crypto_decrypt" => ["decrypt data", "awaiting the result of a `crypto.subtle.decrypt` call"],
-  "op_crypto_derive_bits" => ["derive bits from a key", "awaiting the result of a `crypto.subtle.deriveBits` call"],
-  "op_crypto_encrypt" => ["encrypt data", "awaiting the result of a `crypto.subtle.encrypt` call"],
-  "op_crypto_generate_key" => ["generate a key", "awaiting the result of a `crypto.subtle.generateKey` call"],
-  "op_crypto_sign_key" => ["sign data", "awaiting the result of a `crypto.subtle.sign` call"],
-  "op_crypto_subtle_digest" => ["digest data", "awaiting the result of a `crypto.subtle.digest` call"],
-  "op_crypto_verify_key" => ["verify data", "awaiting the result of a `crypto.subtle.verify` call"],
   "op_dns_resolve" => ["resolve a DNS name", "awaiting the result of a `Deno.resolveDns` call"],
   "op_fetch_send" => ["send a HTTP request", "awaiting the result of a `fetch` call"],
   "op_ffi_call_nonblocking" => ["do a non blocking ffi call", "awaiting the returned promise"],
@@ -373,7 +373,8 @@ pub const OP_DETAILS: phf::Map<&'static str, [&'static str; 2]> = phf_map! {
   "op_fs_make_temp_file_async" => ["create a temporary file", "awaiting the result of a `Deno.makeTempFile` call"],
   "op_fs_mkdir_async" => ["create a directory", "awaiting the result of a `Deno.mkdir` call"],
   "op_fs_open_async" => ["open a file", "awaiting the result of a `Deno.open` call"],
-  "op_fs_read_dir_async" => ["read a directory", "collecting all items in the async iterable returned from a `Deno.readDir` call"],
+  "op_fs_read_dir_async" => ["read a directory", "opening the async iterable returned from a `Deno.readDir` call"],
+  "op_fs_read_dir_async_next" => ["read a directory", "collecting all items in the async iterable returned from a `Deno.readDir` call"],
   "op_fs_read_file_async" => ["read a file", "awaiting the result of a `Deno.readFile` call"],
   "op_fs_read_file_text_async" => ["read a text file", "awaiting the result of a `Deno.readTextFile` call"],
   "op_fs_read_link_async" => ["read a symlink", "awaiting the result of a `Deno.readLink` call"],

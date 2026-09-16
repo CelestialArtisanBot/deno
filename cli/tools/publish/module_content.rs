@@ -1,5 +1,6 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,31 +17,43 @@ use deno_resolver::cache::ParsedSourceCache;
 use deno_resolver::deno_json::CompilerOptionsResolver;
 use deno_resolver::workspace::ResolutionKind;
 use lazy_regex::Lazy;
-use sys_traits::FsMetadata;
-use sys_traits::FsRead;
 
 use super::diagnostics::PublishDiagnostic;
 use super::diagnostics::PublishDiagnosticsCollector;
+use super::unfurl::PositionOrSourceRangeRef;
 use super::unfurl::SpecifierUnfurler;
 use super::unfurl::SpecifierUnfurlerDiagnostic;
+use super::unfurl::SpecifierUnfurlerSys;
 use crate::sys::CliSys;
+use crate::tools::unfurl_utils::is_safe_unquoted_comment_value;
+
+fn jsx_pragma(name: &str, value: &str) -> Result<String, AnyError> {
+  if !is_safe_unquoted_comment_value(value) {
+    return Err(deno_core::anyhow::anyhow!(
+      "Cannot represent compiler option '{name}' as a generated JSX pragma."
+    ));
+  }
+  Ok(format!("/** @{name} {value} */"))
+}
 
 struct JsxFolderOptions<'a> {
-  jsx_factory: &'a str,
-  jsx_fragment_factory: &'a str,
   jsx_runtime: &'static str,
+  jsx_classic: Option<Cow<'a, deno_ast::JsxClassicOptions>>,
   jsx_import_source: Option<String>,
   jsx_import_source_types: Option<String>,
 }
 
-pub struct ModuleContentProvider<TSys: FsMetadata + FsRead = CliSys> {
+#[sys_traits::auto_impl]
+pub trait ModuleContentProviderSys: SpecifierUnfurlerSys {}
+
+pub struct ModuleContentProvider<TSys: ModuleContentProviderSys = CliSys> {
   specifier_unfurler: SpecifierUnfurler<TSys>,
   parsed_source_cache: Arc<ParsedSourceCache>,
   sys: TSys,
   compiler_options_resolver: Arc<CompilerOptionsResolver>,
 }
 
-impl<TSys: FsMetadata + FsRead> ModuleContentProvider<TSys> {
+impl<TSys: ModuleContentProviderSys> ModuleContentProvider<TSys> {
   pub fn new(
     parsed_source_cache: Arc<ParsedSourceCache>,
     specifier_unfurler: SpecifierUnfurler<TSys>,
@@ -86,12 +99,17 @@ impl<TSys: FsMetadata + FsRead> ModuleContentProvider<TSys> {
           | MediaType::Tsx => {
             // continue
           }
+          MediaType::Wasm => {
+            return self.unfurl_wasm(specifier, &data, diagnostics_collector);
+          }
           MediaType::SourceMap
           | MediaType::Unknown
           | MediaType::Html
+          | MediaType::Markdown
           | MediaType::Sql
           | MediaType::Json
-          | MediaType::Wasm
+          | MediaType::Jsonc
+          | MediaType::Json5
           | MediaType::Css => {
             // not unfurlable data
             return Ok(data.into_owned());
@@ -141,6 +159,38 @@ impl<TSys: FsMetadata + FsRead> ModuleContentProvider<TSys> {
       deno_ast::apply_text_changes(text_info.text_str(), text_changes);
 
     Ok(rewritten_text.into_bytes())
+  }
+
+  /// Unfurls the module specifiers found in the import section of a Wasm
+  /// module. See [`super::wasm::unfurl_wasm`].
+  fn unfurl_wasm(
+    &self,
+    specifier: &Url,
+    data: &[u8],
+    diagnostics_collector: &PublishDiagnosticsCollector,
+  ) -> Result<Vec<u8>, AnyError> {
+    log::debug!("Unfurling {}", specifier);
+    let mut reporter = |diagnostic| {
+      diagnostics_collector
+        .push(PublishDiagnostic::SpecifierUnfurl(diagnostic));
+    };
+    // Wasm modules are binary, so there is no source text to point diagnostics
+    // at. Use an empty text info with a zeroed range so any diagnostics report
+    // the referrer without a (meaningless) code frame.
+    let text_info = SourceTextInfo::from_string(String::new());
+    let zeroed_range = deno_graph::PositionRange::zeroed();
+    super::wasm::unfurl_wasm(data, &mut |module_specifier| {
+      self
+        .specifier_unfurler
+        .unfurl_specifier_reporting_diagnostic(
+          specifier,
+          module_specifier,
+          ResolutionKind::Execution,
+          &text_info,
+          PositionOrSourceRangeRef::PositionRange(&zeroed_range),
+          &mut reporter,
+        )
+    })
   }
 
   fn add_jsx_text_changes(
@@ -193,30 +243,26 @@ impl<TSys: FsMetadata + FsRead> ModuleContentProvider<TSys> {
         jsx_options.jsx_runtime,
       ));
     }
-    if module_info.jsx_import_source.is_none() {
-      if let Some(import_source) = jsx_options.jsx_import_source {
-        add_text_change(format!("/** @jsxImportSource {} */", import_source));
+    if module_info.jsx_import_source.is_none()
+      && let Some(import_source) = jsx_options.jsx_import_source
+    {
+      add_text_change(jsx_pragma("jsxImportSource", &import_source)?);
+    }
+    if module_info.jsx_import_source_types.is_none()
+      && let Some(import_source) = jsx_options.jsx_import_source_types
+    {
+      add_text_change(jsx_pragma("jsxImportSourceTypes", &import_source)?);
+    }
+    if let Some(classic_options) = &jsx_options.jsx_classic {
+      if !leading_comments_has_re(&JSX_FACTORY_RE) {
+        add_text_change(jsx_pragma("jsxFactory", &classic_options.factory)?);
       }
-    }
-    if module_info.jsx_import_source_types.is_none() {
-      if let Some(import_source) = jsx_options.jsx_import_source_types {
-        add_text_change(format!(
-          "/** @jsxImportSourceTypes {} */",
-          import_source
-        ));
+      if !leading_comments_has_re(&JSX_FRAGMENT_FACTORY_RE) {
+        add_text_change(jsx_pragma(
+          "jsxFragmentFactory",
+          &classic_options.fragment_factory,
+        )?);
       }
-    }
-    if !leading_comments_has_re(&JSX_FACTORY_RE) {
-      add_text_change(format!(
-        "/** @jsxFactory {} */",
-        jsx_options.jsx_factory,
-      ));
-    }
-    if !leading_comments_has_re(&JSX_FRAGMENT_FACTORY_RE) {
-      add_text_change(format!(
-        "/** @jsxFragmentFactory {} */",
-        jsx_options.jsx_fragment_factory,
-      ));
     }
     Ok(())
   }
@@ -231,10 +277,12 @@ impl<TSys: FsMetadata + FsRead> ModuleContentProvider<TSys> {
       self.compiler_options_resolver.for_specifier(specifier);
     let jsx_config = compiler_options.jsx_import_source_config()?;
     let transpile_options = &compiler_options.transpile_options()?.transpile;
-    let jsx_runtime = if transpile_options.jsx_automatic {
-      "automatic"
-    } else {
-      "classic"
+    let jsx_runtime = match &transpile_options.jsx {
+      Some(
+        deno_ast::JsxRuntime::Automatic(_)
+        | deno_ast::JsxRuntime::Precompile(_),
+      ) => "automatic",
+      None | Some(deno_ast::JsxRuntime::Classic(_)) => "classic",
     };
     let mut unfurl_import_source =
       |import_source: &str, referrer: &Url, resolution_kind: ResolutionKind| {
@@ -245,7 +293,9 @@ impl<TSys: FsMetadata + FsRead> ModuleContentProvider<TSys> {
             import_source,
             resolution_kind,
             text_info,
-            &deno_graph::PositionRange::zeroed(),
+            PositionOrSourceRangeRef::PositionRange(
+              &deno_graph::PositionRange::zeroed(),
+            ),
             diagnostic_reporter,
           );
         maybe_import_source.unwrap_or_else(|| import_source.to_string())
@@ -268,10 +318,19 @@ impl<TSys: FsMetadata + FsRead> ModuleContentProvider<TSys> {
           ResolutionKind::Types,
         )
       });
+    let classic_options = match &transpile_options.jsx {
+      None => Some(Cow::Owned(deno_ast::JsxClassicOptions::default())),
+      Some(deno_ast::JsxRuntime::Classic(classic_options)) => {
+        Some(Cow::Borrowed(classic_options))
+      }
+      Some(
+        deno_ast::JsxRuntime::Precompile(_)
+        | deno_ast::JsxRuntime::Automatic(_),
+      ) => None,
+    };
     Ok(JsxFolderOptions {
       jsx_runtime,
-      jsx_factory: &transpile_options.jsx_factory,
-      jsx_fragment_factory: &transpile_options.jsx_fragment_factory,
+      jsx_classic: classic_options,
       jsx_import_source,
       jsx_import_source_types,
     })
@@ -282,35 +341,40 @@ impl<TSys: FsMetadata + FsRead> ModuleContentProvider<TSys> {
 mod test {
   use std::path::PathBuf;
 
-  use deno_config::workspace::WorkspaceDiscoverStart;
   use deno_path_util::url_from_file_path;
-  use deno_resolver::deno_json::CompilerOptionsOverrides;
-  use deno_resolver::factory::ConfigDiscoveryOption;
-  use deno_resolver::factory::WorkspaceDirectoryProvider;
-  use deno_resolver::npm::ByonmNpmResolverCreateOptions;
-  use deno_resolver::npm::CreateInNpmPkgCheckerOptions;
-  use deno_resolver::npm::DenoInNpmPackageChecker;
-  use deno_resolver::npm::NpmResolverCreateOptions;
-  use deno_resolver::workspace::WorkspaceResolver;
-  use node_resolver::DenoIsBuiltInNodeModuleChecker;
-  use node_resolver::NodeResolver;
-  use node_resolver::NodeResolverOptions;
-  use node_resolver::PackageJsonResolver;
-  use node_resolver::cache::NodeResolutionSys;
+  use deno_resolver::factory::ResolverFactory;
+  use deno_resolver::factory::ResolverFactoryOptions;
+  use deno_resolver::factory::WorkspaceFactory;
+  use deno_resolver::factory::WorkspaceFactoryOptions;
   use pretty_assertions::assert_eq;
   use sys_traits::FsCreateDirAll;
   use sys_traits::FsWrite;
   use sys_traits::impls::InMemorySys;
 
   use super::*;
-  use crate::npm::CliNpmResolver;
 
   #[test]
-  fn test_module_content_jsx() {
+  fn test_jsx_pragma_safety() {
+    assert_eq!(
+      jsx_pragma("jsxImportSource", "npm:react").unwrap(),
+      "/** @jsxImportSource npm:react */"
+    );
+    for value in [
+      "",
+      "npm:package/sub*/path",
+      "npm:package/with space",
+      "line\nbreak",
+    ] {
+      assert!(jsx_pragma("jsxImportSource", value).is_err());
+    }
+  }
+
+  #[tokio::test]
+  async fn test_module_content_jsx() {
     run_test(&[
       (
         "/deno.json",
-        r#"{ "workspace": ["package-a", "package-b"] }"#,
+        r#"{ "nodeModulesDir": "manual", "workspace": ["package-a", "package-b", "package-c", "package-d"] }"#,
         None,
       ),
       (
@@ -339,17 +403,43 @@ mod test {
         None,
       ),
       (
+        "/package-c/deno.json",
+        r#"{
+        "compilerOptions": {
+          "jsx": "precompile",
+          "jsxImportSource": "react",
+          "jsxImportSourceTypes": "@types/react",
+        },
+        "imports": {
+          "react": "npm:react"
+          "@types/react": "npm:@types/react"
+        }
+      }"#,
+        None,
+      ),
+      (
+        "/package-d/deno.json",
+        r#"{
+        "compilerOptions": { "jsx": "react" },
+        "imports": {
+          "react": "npm:react"
+          "@types/react": "npm:@types/react"
+        }
+      }"#,
+        None,
+      ),
+      (
         "/package-a/main.tsx",
         "export const component = <div></div>;",
         Some(
-          "/** @jsxRuntime automatic *//** @jsxImportSource npm:react *//** @jsxImportSourceTypes npm:@types/react *//** @jsxFactory React.createElement *//** @jsxFragmentFactory React.Fragment */export const component = <div></div>;",
+          "/** @jsxRuntime automatic *//** @jsxImportSource npm:react *//** @jsxImportSourceTypes npm:@types/react */export const component = <div></div>;",
         ),
       ),
       (
         "/package-b/main.tsx",
         "export const componentB = <div></div>;",
         Some(
-          "/** @jsxRuntime automatic *//** @jsxImportSource npm:react *//** @jsxImportSourceTypes npm:react *//** @jsxFactory React.createElement *//** @jsxFragmentFactory React.Fragment */export const componentB = <div></div>;",
+          "/** @jsxRuntime automatic *//** @jsxImportSource npm:react *//** @jsxImportSourceTypes npm:react */export const componentB = <div></div>;",
         ),
       ),
       (
@@ -369,7 +459,164 @@ mod test {
         export const component = <div></div>;",
         ),
       ),
-    ]);
+      (
+        "/package-c/main.tsx",
+        "export const component = <div></div>;",
+        Some(
+          "/** @jsxRuntime automatic *//** @jsxImportSource npm:react *//** @jsxImportSourceTypes npm:@types/react */export const component = <div></div>;",
+        ),
+      ),
+      (
+        "/package-d/main.tsx",
+        "export const component = <div></div>;",
+        Some(
+          "/** @jsxRuntime classic *//** @jsxFactory React.createElement *//** @jsxFragmentFactory React.Fragment */export const component = <div></div>;",
+        ),
+      ),
+    ]).await;
+  }
+
+  #[tokio::test]
+  async fn test_module_content_rejects_unrepresentable_jsx_pragma() {
+    let in_memory_sys = InMemorySys::default();
+    in_memory_sys.fs_create_dir_all(get_path("/")).unwrap();
+    in_memory_sys
+      .fs_write(
+        get_path("/deno.json"),
+        r#"{
+          "compilerOptions": {
+            "jsx": "react-jsx",
+            "jsxImportSource": "npm:package/sub*/path"
+          }
+        }"#,
+      )
+      .unwrap();
+    in_memory_sys
+      .fs_write(
+        get_path("/main.tsx"),
+        "export const component = <div></div>;",
+      )
+      .unwrap();
+
+    let provider = module_content_provider(in_memory_sys).await;
+    let path = get_path("/main.tsx");
+    let error = provider
+      .resolve_content_maybe_unfurling(
+        &ModuleGraph::new(deno_graph::GraphKind::All),
+        &Default::default(),
+        &path,
+        &url_from_file_path(&path).unwrap(),
+      )
+      .unwrap_err();
+    assert!(
+      error
+        .to_string()
+        .contains("Cannot represent compiler option 'jsxImportSource'")
+    );
+  }
+
+  #[tokio::test]
+  async fn test_module_content_wasm() {
+    let in_memory_sys = InMemorySys::default();
+    in_memory_sys.fs_create_dir_all(get_path("/")).unwrap();
+    in_memory_sys
+      .fs_write(
+        get_path("/deno.json"),
+        r#"{
+          "name": "@scope/pkg",
+          "version": "1.0.0",
+          "exports": "./main.wasm",
+          "nodeModulesDir": "manual",
+          "imports": {
+            "@std/foo": "jsr:@std/foo@1",
+            "chalk": "npm:chalk@5"
+          }
+        }"#,
+      )
+      .unwrap();
+
+    // A Wasm module importing a bare specifier (mapped via the import map), an
+    // npm specifier (mapped via the import map) and a relative specifier (left
+    // as-is).
+    let wasm = build_wasm_with_imports(&["@std/foo", "chalk", "./other.js"]);
+    in_memory_sys
+      .fs_write(get_path("/main.wasm"), &wasm)
+      .unwrap();
+
+    let provider = module_content_provider(in_memory_sys).await;
+    let path = get_path("/main.wasm");
+    let bytes = provider
+      .resolve_content_maybe_unfurling(
+        &ModuleGraph::new(deno_graph::GraphKind::All),
+        &Default::default(),
+        &path,
+        &url_from_file_path(&path).unwrap(),
+      )
+      .unwrap();
+
+    assert_eq!(
+      wasm_import_modules(&bytes),
+      vec![
+        "jsr:@std/foo@1".to_string(),
+        "npm:chalk@5".to_string(),
+        "./other.js".to_string(),
+      ]
+    );
+  }
+
+  fn build_wasm_with_imports(modules: &[&str]) -> Vec<u8> {
+    fn write_var_u32(mut value: u32, output: &mut Vec<u8>) {
+      loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+          byte |= 0x80;
+        }
+        output.push(byte);
+        if value == 0 {
+          break;
+        }
+      }
+    }
+
+    fn write_wasm_string(value: &str, output: &mut Vec<u8>) {
+      write_var_u32(value.len() as u32, output);
+      output.extend_from_slice(value.as_bytes());
+    }
+
+    fn section(id: u8, body: &[u8], output: &mut Vec<u8>) {
+      output.push(id);
+      write_var_u32(body.len() as u32, output);
+      output.extend_from_slice(body);
+    }
+
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+
+    let types = [0x01, 0x60, 0x00, 0x00];
+    section(1, &types, &mut wasm);
+
+    let mut imports = Vec::new();
+    write_var_u32(modules.len() as u32, &mut imports);
+    for (i, module) in modules.iter().enumerate() {
+      write_wasm_string(module, &mut imports);
+      write_wasm_string(&format!("import_{i}"), &mut imports);
+      imports.extend_from_slice(&[0x00, 0x00]);
+    }
+    section(2, &imports, &mut wasm);
+
+    wasm
+  }
+
+  fn wasm_import_modules(bytes: &[u8]) -> Vec<String> {
+    let mut modules = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+      if let wasmparser::Payload::ImportSection(reader) = payload.unwrap() {
+        for import in reader.into_imports() {
+          modules.push(import.unwrap().module.to_string());
+        }
+      }
+    }
+    modules
   }
 
   fn get_path(path: &str) -> PathBuf {
@@ -380,7 +627,9 @@ mod test {
     })
   }
 
-  fn run_test(files: &[(&'static str, &'static str, Option<&'static str>)]) {
+  async fn run_test(
+    files: &[(&'static str, &'static str, Option<&'static str>)],
+  ) {
     let in_memory_sys = InMemorySys::default();
     for (path, text, _) in files {
       let path = get_path(path);
@@ -389,7 +638,7 @@ mod test {
         .unwrap();
       in_memory_sys.fs_write(path, text).unwrap();
     }
-    let provider = module_content_provider(in_memory_sys);
+    let provider = module_content_provider(in_memory_sys).await;
     for (path, _, expected) in files {
       let Some(expected) = expected else {
         continue;
@@ -407,52 +656,49 @@ mod test {
     }
   }
 
-  fn module_content_provider(
+  async fn module_content_provider(
     sys: InMemorySys,
   ) -> ModuleContentProvider<InMemorySys> {
-    let workspace_dir = deno_config::workspace::WorkspaceDirectory::discover(
-      &sys,
-      WorkspaceDiscoverStart::Paths(&[get_path("/")]),
-      &Default::default(),
-    )
-    .unwrap();
-    let resolver = Arc::new(
-      WorkspaceResolver::from_workspace(
-        &workspace_dir.workspace,
-        sys.clone(),
-        Default::default(),
-      )
-      .unwrap(),
+    let cwd = get_path("/");
+
+    let workspace_factory = Arc::new(WorkspaceFactory::new(
+      sys.clone(),
+      cwd.to_path_buf(),
+      WorkspaceFactoryOptions {
+        maybe_custom_deno_dir_root: Some(cwd.join("deno_dir")),
+        ..Default::default()
+      },
+    ));
+    let resolver_factory = ResolverFactory::new(
+      workspace_factory,
+      ResolverFactoryOptions {
+        package_json_dep_resolution: Some(
+          deno_resolver::workspace::PackageJsonDepResolution::Enabled,
+        ),
+        unstable_sloppy_imports: true,
+        ..Default::default()
+      },
     );
-    let specifier_unfurler = SpecifierUnfurler::new(None, resolver, false);
-    let package_json_resolver =
-      Arc::new(PackageJsonResolver::new(sys.clone(), None));
-    let node_resolver = Arc::new(NodeResolver::new(
-      DenoInNpmPackageChecker::new(CreateInNpmPkgCheckerOptions::Byonm),
-      DenoIsBuiltInNodeModuleChecker,
-      CliNpmResolver::new(NpmResolverCreateOptions::Byonm(
-        ByonmNpmResolverCreateOptions {
-          root_node_modules_dir: None,
-          sys: NodeResolutionSys::new(sys.clone(), None),
-          pkg_json_resolver: package_json_resolver.clone(),
-        },
-      )),
-      package_json_resolver,
-      NodeResolutionSys::new(sys.clone(), None),
-      NodeResolverOptions::default(),
-    ));
-    let compiler_options_resolver = Arc::new(CompilerOptionsResolver::new(
-      &sys,
-      &WorkspaceDirectoryProvider::from_initial_dir(&Arc::new(workspace_dir)),
-      &node_resolver,
-      &ConfigDiscoveryOption::DiscoverCwd,
-      &CompilerOptionsOverrides::default(),
-    ));
+
+    let specifier_unfurler = SpecifierUnfurler::new(
+      resolver_factory.node_resolver().unwrap().clone(),
+      resolver_factory.npm_req_resolver().unwrap().clone(),
+      resolver_factory.pkg_json_resolver().clone(),
+      resolver_factory
+        .workspace_factory()
+        .workspace_directory()
+        .unwrap()
+        .clone(),
+      resolver_factory.workspace_resolver().await.unwrap().clone(),
+    );
     ModuleContentProvider::new(
       Arc::new(ParsedSourceCache::default()),
       specifier_unfurler,
       sys,
-      compiler_options_resolver,
+      resolver_factory
+        .compiler_options_resolver()
+        .unwrap()
+        .clone(),
     )
   }
 }

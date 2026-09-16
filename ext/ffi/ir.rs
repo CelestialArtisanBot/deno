@@ -1,12 +1,40 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::ffi::c_void;
 use std::ptr;
+use std::ptr::NonNull;
 
 use deno_core::v8;
 use libffi::middle::Arg;
 
 use crate::symbol::NativeType;
+
+/// Holds V8 backing store references to prevent GC from freeing ArrayBuffer
+/// memory while nonblocking FFI calls are in progress on background threads.
+pub struct BackingStoreHolder(Vec<v8::SharedRef<v8::BackingStore>>);
+
+// SAFETY: v8::SharedRef<v8::BackingStore> is ref-counted and safe to send
+// across threads. We hold these references solely to prevent deallocation.
+unsafe impl Send for BackingStoreHolder {}
+
+impl BackingStoreHolder {
+  pub fn new() -> Self {
+    Self(Vec::new())
+  }
+
+  fn push(
+    &mut self,
+    store: v8::SharedRef<v8::BackingStore>,
+  ) -> Result<(), IRError> {
+    // A shared reference keeps the backing store object alive, but it cannot
+    // keep a user-resizable store's data pointer stable across an async call.
+    if store.is_resizable_by_user_javascript() {
+      return Err(IRError::ResizableBackingStore);
+    }
+    self.0.push(store);
+    Ok(())
+  }
+}
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
 #[class(type)]
@@ -49,29 +77,82 @@ pub enum IRError {
   InvalidArrayBuffer,
   #[error("Invalid FFI struct type, expected ArrayBuffer, or ArrayBufferView")]
   InvalidStructType,
+  #[error(
+    "Resizable backing stores are not supported for nonblocking FFI calls"
+  )]
+  ResizableBackingStore,
+  #[error(
+    "Invalid FFI struct return buffer: expected at least {expected} bytes, got {actual}"
+  )]
+  InvalidStructReturnBuffer { expected: usize, actual: usize },
+  #[error("Missing FFI struct return buffer")]
+  MissingStructReturnBuffer,
   #[error("Invalid FFI function type, expected null, or External")]
   InvalidFunctionType,
 }
 
-pub struct OutBuffer(pub *mut u8);
+#[derive(Clone, Copy)]
+pub struct OutBuffer {
+  ptr: Option<NonNull<u8>>,
+  byte_length: usize,
+}
 
-// SAFETY: OutBuffer is allocated by us in 00_ffi.js and is guaranteed to be
-// only used for the purpose of writing return value of structs.
+// SAFETY: synchronous callers keep the TypedArray alive for the duration of the
+// call, while nonblocking callers retain its backing store in a holder.
 unsafe impl Send for OutBuffer {}
 // SAFETY: See above
 unsafe impl Sync for OutBuffer {}
 
+impl OutBuffer {
+  pub fn validate_size(self, expected: usize) -> Result<Self, IRError> {
+    if self.byte_length < expected {
+      return Err(IRError::InvalidStructReturnBuffer {
+        expected,
+        actual: self.byte_length,
+      });
+    }
+    self.ptr.ok_or(IRError::InvalidStructReturnBuffer {
+      expected,
+      actual: self.byte_length,
+    })?;
+    Ok(self)
+  }
+
+  pub fn as_ptr(self) -> *mut u8 {
+    self
+      .ptr
+      .expect("struct return buffer was validated")
+      .as_ptr()
+  }
+}
+
 pub fn out_buffer_as_ptr(
-  scope: &mut v8::HandleScope,
   out_buffer: Option<v8::Local<v8::TypedArray>>,
 ) -> Option<OutBuffer> {
+  out_buffer.map(|out_buffer| OutBuffer {
+    ptr: NonNull::new(out_buffer.data().cast()),
+    byte_length: out_buffer.byte_length(),
+  })
+}
+
+/// Like `out_buffer_as_ptr` but also returns the backing store reference
+/// to prevent GC from freeing the buffer during nonblocking FFI calls.
+pub fn out_buffer_as_ptr_nonblocking(
+  out_buffer: Option<v8::Local<v8::TypedArray>>,
+  holder: &mut BackingStoreHolder,
+) -> Result<Option<OutBuffer>, IRError> {
   match out_buffer {
     Some(out_buffer) => {
-      let ab = out_buffer.buffer(scope).unwrap();
-      ab.data()
-        .map(|non_null| OutBuffer(non_null.as_ptr() as *mut u8))
+      let byte_length = out_buffer.byte_length();
+      if let Some(backing_store) = out_buffer.get_backing_store() {
+        holder.push(backing_store)?;
+      }
+      Ok(Some(OutBuffer {
+        ptr: NonNull::new(out_buffer.data().cast()),
+        byte_length,
+      }))
     }
-    None => None,
+    None => Ok(None),
   }
 }
 
@@ -97,8 +178,11 @@ pub union NativeValue {
 }
 
 impl NativeValue {
-  pub unsafe fn as_arg(&self, native_type: &NativeType) -> Arg {
-    #[allow(clippy::undocumented_unsafe_blocks)]
+  pub unsafe fn as_arg(&self, native_type: &NativeType) -> Arg<'_> {
+    #[allow(
+      clippy::undocumented_unsafe_blocks,
+      reason = "safety comment on the containing block"
+    )]
     unsafe {
       match native_type {
         NativeType::Void => unreachable!(),
@@ -127,10 +211,13 @@ impl NativeValue {
   #[inline]
   pub unsafe fn to_v8<'scope>(
     &self,
-    scope: &mut v8::HandleScope<'scope>,
+    scope: &mut v8::PinScope<'scope, '_>,
     native_type: NativeType,
   ) -> v8::Local<'scope, v8::Value> {
-    #[allow(clippy::undocumented_unsafe_blocks)]
+    #[allow(
+      clippy::undocumented_unsafe_blocks,
+      reason = "safety comment on the containing block"
+    )]
     unsafe {
       match native_type {
         NativeType::Void => v8::undefined(scope).into(),
@@ -252,7 +339,7 @@ pub fn ffi_parse_i32_arg(
 
 #[inline]
 pub fn ffi_parse_u64_arg(
-  scope: &mut v8::HandleScope,
+  scope: &mut v8::PinScope<'_, '_>,
   arg: v8::Local<v8::Value>,
 ) -> Result<NativeValue, IRError> {
   // Order of checking:
@@ -271,7 +358,7 @@ pub fn ffi_parse_u64_arg(
 
 #[inline]
 pub fn ffi_parse_i64_arg(
-  scope: &mut v8::HandleScope,
+  scope: &mut v8::PinScope<'_, '_>,
   arg: v8::Local<v8::Value>,
 ) -> Result<NativeValue, IRError> {
   // Order of checking:
@@ -290,7 +377,7 @@ pub fn ffi_parse_i64_arg(
 
 #[inline]
 pub fn ffi_parse_usize_arg(
-  scope: &mut v8::HandleScope,
+  scope: &mut v8::PinScope<'_, '_>,
   arg: v8::Local<v8::Value>,
 ) -> Result<NativeValue, IRError> {
   // Order of checking:
@@ -309,7 +396,7 @@ pub fn ffi_parse_usize_arg(
 
 #[inline]
 pub fn ffi_parse_isize_arg(
-  scope: &mut v8::HandleScope,
+  scope: &mut v8::PinScope<'_, '_>,
   arg: v8::Local<v8::Value>,
 ) -> Result<NativeValue, IRError> {
   // Order of checking:
@@ -348,7 +435,7 @@ pub fn ffi_parse_f64_arg(
 
 #[inline]
 pub fn ffi_parse_pointer_arg(
-  _scope: &mut v8::HandleScope,
+  _scope: &mut v8::PinScope<'_, '_>,
   arg: v8::Local<v8::Value>,
 ) -> Result<NativeValue, IRError> {
   let pointer = if let Ok(value) = v8::Local::<v8::External>::try_from(arg) {
@@ -406,9 +493,30 @@ pub fn ffi_parse_buffer_arg(
   Ok(NativeValue { pointer })
 }
 
+/// Like `ffi_parse_buffer_arg` but also retains the backing store reference
+/// in the holder to prevent GC from freeing the buffer during nonblocking
+/// FFI calls.
+#[inline]
+pub fn ffi_parse_buffer_arg_nonblocking(
+  scope: &mut v8::PinScope<'_, '_>,
+  arg: v8::Local<v8::Value>,
+  holder: &mut BackingStoreHolder,
+) -> Result<NativeValue, IRError> {
+  // Retain the backing store before extracting the raw pointer.
+  if let Ok(value) = v8::Local::<v8::ArrayBuffer>::try_from(arg) {
+    holder.push(value.get_backing_store())?;
+  } else if let Ok(value) = v8::Local::<v8::ArrayBufferView>::try_from(arg)
+    && let Some(ab) = value.buffer(scope)
+  {
+    holder.push(ab.get_backing_store())?;
+  }
+  let pointer = parse_buffer_arg(arg)?;
+  Ok(NativeValue { pointer })
+}
+
 #[inline]
 pub fn ffi_parse_struct_arg(
-  scope: &mut v8::HandleScope,
+  scope: &mut v8::PinScope<'_, '_>,
   arg: v8::Local<v8::Value>,
 ) -> Result<NativeValue, IRError> {
   // Order of checking:
@@ -440,9 +548,27 @@ pub fn ffi_parse_struct_arg(
   Ok(NativeValue { pointer })
 }
 
+/// Like `ffi_parse_struct_arg` but also retains the backing store reference
+/// to prevent GC from freeing the buffer during nonblocking FFI calls.
+#[inline]
+pub fn ffi_parse_struct_arg_nonblocking(
+  scope: &mut v8::PinScope<'_, '_>,
+  arg: v8::Local<v8::Value>,
+  holder: &mut BackingStoreHolder,
+) -> Result<NativeValue, IRError> {
+  if let Ok(value) = v8::Local::<v8::ArrayBuffer>::try_from(arg) {
+    holder.push(value.get_backing_store())?;
+  } else if let Ok(value) = v8::Local::<v8::ArrayBufferView>::try_from(arg)
+    && let Some(ab) = value.buffer(scope)
+  {
+    holder.push(ab.get_backing_store())?;
+  }
+  ffi_parse_struct_arg(scope, arg)
+}
+
 #[inline]
 pub fn ffi_parse_function_arg(
-  _scope: &mut v8::HandleScope,
+  _scope: &mut v8::PinScope<'_, '_>,
   arg: v8::Local<v8::Value>,
 ) -> Result<NativeValue, IRError> {
   let pointer = if let Ok(value) = v8::Local::<v8::External>::try_from(arg) {
@@ -456,7 +582,7 @@ pub fn ffi_parse_function_arg(
 }
 
 pub fn ffi_parse_args<'scope>(
-  scope: &mut v8::HandleScope<'scope>,
+  scope: &mut v8::PinScope<'scope, '_>,
   args: v8::Local<v8::Array>,
   parameter_types: &[NativeType],
 ) -> Result<Vec<NativeValue>, IRError>
@@ -517,6 +643,89 @@ where
       }
       NativeType::Struct(_) => {
         ffi_args.push(ffi_parse_struct_arg(scope, value)?);
+      }
+      NativeType::Pointer => {
+        ffi_args.push(ffi_parse_pointer_arg(scope, value)?);
+      }
+      NativeType::Function => {
+        ffi_args.push(ffi_parse_function_arg(scope, value)?);
+      }
+      NativeType::Void => {
+        unreachable!();
+      }
+    }
+  }
+
+  Ok(ffi_args)
+}
+
+/// Like `ffi_parse_args` but also retains backing store references for buffer
+/// and struct arguments, preventing GC from freeing the underlying memory
+/// while nonblocking FFI calls are in progress on background threads.
+pub fn ffi_parse_args_nonblocking<'scope>(
+  scope: &mut v8::PinScope<'scope, '_>,
+  args: v8::Local<v8::Array>,
+  parameter_types: &[NativeType],
+  holder: &mut BackingStoreHolder,
+) -> Result<Vec<NativeValue>, IRError>
+where
+  'scope: 'scope,
+{
+  if parameter_types.is_empty() {
+    return Ok(vec![]);
+  }
+
+  let mut ffi_args: Vec<NativeValue> =
+    Vec::with_capacity(parameter_types.len());
+
+  for (index, native_type) in parameter_types.iter().enumerate() {
+    let value = args.get_index(scope, index as u32).unwrap();
+    match native_type {
+      NativeType::Bool => {
+        ffi_args.push(ffi_parse_bool_arg(value)?);
+      }
+      NativeType::U8 => {
+        ffi_args.push(ffi_parse_u8_arg(value)?);
+      }
+      NativeType::I8 => {
+        ffi_args.push(ffi_parse_i8_arg(value)?);
+      }
+      NativeType::U16 => {
+        ffi_args.push(ffi_parse_u16_arg(value)?);
+      }
+      NativeType::I16 => {
+        ffi_args.push(ffi_parse_i16_arg(value)?);
+      }
+      NativeType::U32 => {
+        ffi_args.push(ffi_parse_u32_arg(value)?);
+      }
+      NativeType::I32 => {
+        ffi_args.push(ffi_parse_i32_arg(value)?);
+      }
+      NativeType::U64 => {
+        ffi_args.push(ffi_parse_u64_arg(scope, value)?);
+      }
+      NativeType::I64 => {
+        ffi_args.push(ffi_parse_i64_arg(scope, value)?);
+      }
+      NativeType::USize => {
+        ffi_args.push(ffi_parse_usize_arg(scope, value)?);
+      }
+      NativeType::ISize => {
+        ffi_args.push(ffi_parse_isize_arg(scope, value)?);
+      }
+      NativeType::F32 => {
+        ffi_args.push(ffi_parse_f32_arg(value)?);
+      }
+      NativeType::F64 => {
+        ffi_args.push(ffi_parse_f64_arg(value)?);
+      }
+      NativeType::Buffer => {
+        ffi_args.push(ffi_parse_buffer_arg_nonblocking(scope, value, holder)?);
+      }
+      NativeType::Struct(_) => {
+        // Struct args also extract pointers from ArrayBuffers
+        ffi_args.push(ffi_parse_struct_arg_nonblocking(scope, value, holder)?);
       }
       NativeType::Pointer => {
         ffi_args.push(ffi_parse_pointer_arg(scope, value)?);

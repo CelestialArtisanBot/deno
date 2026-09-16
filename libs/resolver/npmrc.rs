@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -7,16 +7,17 @@ use std::path::PathBuf;
 
 use boxed_error::Boxed;
 use deno_config::workspace::Workspace;
-use deno_npm::npm_rc::NpmRc;
-use deno_npm::npm_rc::ResolvedNpmRc;
+use deno_npmrc::NpmRc;
+use deno_npmrc::NpmRegistryUrl;
+use deno_npmrc::RegistryConfigWithUrl;
+use deno_npmrc::ResolvedNpmRc;
 use sys_traits::EnvHomeDir;
 use sys_traits::EnvVar;
 use sys_traits::FsRead;
 use thiserror::Error;
-use url::Url;
 
-#[allow(clippy::disallowed_types)]
-pub type ResolvedNpmRcRc = crate::sync::MaybeArc<ResolvedNpmRc>;
+#[allow(clippy::disallowed_types, reason = "definition")]
+pub type ResolvedNpmRcRc = deno_maybe_sync::MaybeArc<ResolvedNpmRc>;
 
 #[derive(Debug, Boxed)]
 pub struct NpmRcDiscoverError(pub Box<NpmRcDiscoverErrorKind>);
@@ -46,7 +47,7 @@ pub struct NpmRcLoadError {
 pub struct NpmRcParseError {
   path: PathBuf,
   #[source]
-  source: std::io::Error,
+  source: deno_npmrc::NpmRcParseError,
 }
 
 #[derive(Debug, Error)]
@@ -54,7 +55,7 @@ pub struct NpmRcParseError {
 pub struct NpmRcOptionsResolveError {
   path: PathBuf,
   #[source]
-  source: deno_npm::npm_rc::ResolveError,
+  source: deno_npmrc::ResolveError,
 }
 
 /// Discover `.npmrc` file - currently we only support it next to `package.json`,
@@ -77,6 +78,17 @@ pub fn discover_npmrc_from_workspace<TSys: EnvVar + EnvHomeDir + FsRead>(
       _ => None,
     },
   )
+}
+
+/// Discover only the `.npmrc` file in the user's home directory.
+///
+/// This is useful for internal tooling that should honor user-level registry
+/// configuration without accepting package settings from the current
+/// workspace.
+pub fn discover_npmrc_from_home<TSys: EnvVar + EnvHomeDir + FsRead>(
+  sys: &TSys,
+) -> Result<(ResolvedNpmRc, Option<PathBuf>), NpmRcDiscoverError> {
+  discover_npmrc(sys, None, None)
 }
 
 fn discover_npmrc<TSys: EnvVar + EnvHomeDir + FsRead>(
@@ -105,15 +117,11 @@ fn discover_npmrc<TSys: EnvVar + EnvHomeDir + FsRead>(
     source: &str,
     path: &Path,
   ) -> Result<NpmRc, NpmRcDiscoverError> {
-    let npmrc = NpmRc::parse(source, &|name| sys.env_var(name).ok()).map_err(
-      |source| {
-        NpmRcParseError {
-          path: path.to_path_buf(),
-          // todo(dsherret): use source directly here once it's no longer an internal type
-          source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
-        }
-      },
-    )?;
+    let npmrc =
+      NpmRc::parse(sys, source).map_err(|source| NpmRcParseError {
+        path: path.to_path_buf(),
+        source,
+      })?;
     log::debug!(".npmrc found at: '{}'", path.display());
     Ok(npmrc)
   }
@@ -139,6 +147,33 @@ fn discover_npmrc<TSys: EnvVar + EnvHomeDir + FsRead>(
         project_rc.registry_configs,
         home_rc.registry_configs,
       ),
+      replace_registry_host: project_rc
+        .replace_registry_host
+        .or(home_rc.replace_registry_host),
+      min_release_age_days: project_rc
+        .min_release_age_days
+        .or(home_rc.min_release_age_days),
+      trust_policy: if project_rc.trust_policy
+        != deno_npmrc::TrustPolicyConfig::Off
+      {
+        project_rc.trust_policy
+      } else {
+        home_rc.trust_policy
+      },
+      trust_policy_ignore_after_minutes: project_rc
+        .trust_policy_ignore_after_minutes
+        .or(home_rc.trust_policy_ignore_after_minutes),
+      // union of project and home excludes (project entries first), so an
+      // exemption in either file applies
+      trust_policy_exclude: {
+        let mut excludes = project_rc.trust_policy_exclude;
+        for pkg in home_rc.trust_policy_exclude {
+          if !excludes.contains(&pkg) {
+            excludes.push(pkg);
+          }
+        }
+        excludes
+      },
     }
   }
 
@@ -166,37 +201,41 @@ fn discover_npmrc<TSys: EnvVar + EnvHomeDir + FsRead>(
   }
 
   // 2. Try `.npmrc` next to `package.json`
-  if let Some(package_json_path) = maybe_package_json_path {
-    if let Some(package_json_dir) = package_json_path.parent() {
-      if let Some((source, path)) = try_to_read_npmrc(sys, package_json_dir)? {
-        let npmrc = try_to_parse_npmrc(sys, &source, &path)?;
-        project_npmrc = Some((path, npmrc));
-      }
-    }
+  if let Some(package_json_path) = maybe_package_json_path
+    && let Some(package_json_dir) = package_json_path.parent()
+    && let Some((source, path)) = try_to_read_npmrc(sys, package_json_dir)?
+  {
+    let npmrc = try_to_parse_npmrc(sys, &source, &path)?;
+    project_npmrc = Some((path, npmrc));
   }
 
   // 3. Try `.npmrc` next to `deno.json(c)` when not found `package.json`
-  if project_npmrc.is_none() {
-    if let Some(deno_json_path) = maybe_deno_json_path {
-      if let Some(deno_json_dir) = deno_json_path.parent() {
-        if let Some((source, path)) = try_to_read_npmrc(sys, deno_json_dir)? {
-          let npmrc = try_to_parse_npmrc(sys, &source, &path)?;
-          project_npmrc = Some((path, npmrc));
-        }
-      }
-    }
+  if project_npmrc.is_none()
+    && let Some(deno_json_path) = maybe_deno_json_path
+    && let Some(deno_json_dir) = deno_json_path.parent()
+    && let Some((source, path)) = try_to_read_npmrc(sys, deno_json_dir)?
+  {
+    let npmrc = try_to_parse_npmrc(sys, &source, &path)?;
+    project_npmrc = Some((path, npmrc));
   }
 
   let resolve_npmrc = |path: PathBuf, npm_rc: NpmRc| {
-    Ok((
-      npm_rc
-        .as_resolved(&npm_registry_url(sys))
-        .map_err(|source| NpmRcOptionsResolveError {
+    let registry_url = NpmRegistryUrl::for_npm(sys);
+    let mut resolved_npm_rc =
+      npm_rc.as_resolved(&registry_url).map_err(|source| {
+        NpmRcOptionsResolveError {
           path: path.to_path_buf(),
           source,
-        })?,
-      Some(path),
-    ))
+        }
+      })?;
+    resolved_npm_rc
+      .scopes
+      .entry("jsr".to_string())
+      .or_insert_with(|| RegistryConfigWithUrl {
+        registry_url: NpmRegistryUrl::for_jsr(sys).url,
+        config: Default::default(),
+      });
+    Ok((resolved_npm_rc, Some(path)))
   };
 
   match (home_npmrc, project_npmrc) {
@@ -222,29 +261,65 @@ fn discover_npmrc<TSys: EnvVar + EnvHomeDir + FsRead>(
 
 pub fn create_default_npmrc(sys: &impl EnvVar) -> ResolvedNpmRc {
   ResolvedNpmRc {
-    default_config: deno_npm::npm_rc::RegistryConfigWithUrl {
-      registry_url: npm_registry_url(sys).clone(),
+    default_config: deno_npmrc::RegistryConfigWithUrl {
+      registry_url: NpmRegistryUrl::for_npm(sys).url,
       config: Default::default(),
     },
-    scopes: Default::default(),
+    scopes: HashMap::from([(
+      "jsr".to_string(),
+      RegistryConfigWithUrl {
+        registry_url: NpmRegistryUrl::for_jsr(sys).url,
+        config: Default::default(),
+      },
+    )]),
     registry_configs: Default::default(),
+    replace_registry_host: deno_npmrc::ReplaceRegistryHost::for_npm(sys)
+      .unwrap_or_default(),
+    min_release_age_days: deno_npmrc::min_release_age_days_from_env(sys),
+    trust_policy: Default::default(),
+    trust_policy_ignore_after_minutes: None,
+    trust_policy_exclude: Vec::new(),
   }
 }
 
-pub fn npm_registry_url(sys: &impl EnvVar) -> Url {
-  let env_var_name = "NPM_CONFIG_REGISTRY";
-  if let Ok(registry_url) = sys.env_var(env_var_name) {
-    // ensure there is a trailing slash for the directory
-    let registry_url = format!("{}/", registry_url.trim_end_matches('/'));
-    match Url::parse(&registry_url) {
-      Ok(url) => {
-        return url;
-      }
-      Err(err) => {
-        log::debug!("Invalid {} environment variable: {:#}", env_var_name, err,);
-      }
-    }
-  }
+#[cfg(test)]
+mod test {
+  use sys_traits::EnvSetVar;
+  use sys_traits::impls::InMemorySys;
 
-  Url::parse("https://registry.npmjs.org").unwrap()
+  use super::*;
+
+  #[test]
+  fn discover_npmrc_from_home_ignores_workspace_config() {
+    let sys = InMemorySys::new_with_cwd("/workspace");
+    sys.env_set_var("HOME", "/home/test");
+    sys.fs_insert(
+      "/home/test/.npmrc",
+      concat!(
+        "registry=http://home.example/\n",
+        "//home.example/:_authToken=test-token\n",
+        "trust-policy=no-downgrade\n",
+      ),
+    );
+    sys.fs_insert("/workspace/.npmrc", "registry=http://workspace.example/\n");
+
+    let (npmrc, path) = discover_npmrc_from_home(&sys).unwrap();
+
+    assert_eq!(path, Some(PathBuf::from("/home/test/.npmrc")));
+    assert_eq!(
+      npmrc.get_registry_url("@esbuild/linux-x64").as_str(),
+      "http://home.example/"
+    );
+    assert_eq!(
+      npmrc
+        .get_registry_config("@esbuild/linux-x64")
+        .auth_token
+        .as_deref(),
+      Some("test-token")
+    );
+    assert_eq!(
+      npmrc.trust_policy,
+      deno_npmrc::TrustPolicyConfig::NoDowngrade
+    );
+  }
 }

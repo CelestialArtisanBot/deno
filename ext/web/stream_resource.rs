@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cell::RefMut;
@@ -120,7 +120,7 @@ impl BoundedBufferChannelInner {
   /// calling this.
   #[inline(always)]
   unsafe fn next_unsafe(&mut self) -> &mut V8Slice<u8> {
-    #[allow(clippy::undocumented_unsafe_blocks)]
+    // SAFETY: caller guarantees ring_consumer is a valid index
     unsafe {
       self
         .buffers
@@ -135,7 +135,7 @@ impl BoundedBufferChannelInner {
   /// calling this.
   #[inline(always)]
   unsafe fn take_next_unsafe(&mut self) -> V8Slice<u8> {
-    #[allow(clippy::undocumented_unsafe_blocks)]
+    // SAFETY: caller guarantees ring_consumer is a valid index
     unsafe {
       let res = std::ptr::read(self.next_unsafe());
       self.ring_consumer = (self.ring_consumer + 1) % BUFFER_CHANNEL_SIZE;
@@ -210,10 +210,10 @@ impl BoundedBufferChannelInner {
 
     if self.write_waker.is_some() {
       // We may be able to write again if we have buffer and byte room in the channel
-      if self.can_write() {
-        if let Some(waker) = self.write_waker.take() {
-          waker.wake();
-        }
+      if self.can_write()
+        && let Some(waker) = self.write_waker.take()
+      {
+        waker.wake();
       }
     }
 
@@ -321,7 +321,7 @@ struct BoundedBufferChannel {
 impl BoundedBufferChannel {
   // TODO(mmastrac): in release mode we should be able to make this an UnsafeCell
   #[inline(always)]
-  fn inner(&self) -> RefMut<BoundedBufferChannelInner> {
+  fn inner(&self) -> RefMut<'_, BoundedBufferChannelInner> {
     self.inner.borrow_mut()
   }
 
@@ -366,7 +366,6 @@ impl BoundedBufferChannel {
   }
 }
 
-#[allow(clippy::type_complexity)]
 struct ReadableStreamResource {
   read_queue: Rc<TaskQueue>,
   channel: BoundedBufferChannel,
@@ -407,7 +406,7 @@ impl ReadableStreamResource {
 }
 
 impl Resource for ReadableStreamResource {
-  fn name(&self) -> Cow<str> {
+  fn name(&self) -> Cow<'_, str> {
     Cow::Borrowed("readableStream")
   }
 
@@ -538,7 +537,7 @@ fn drop_sender(sender: *const c_void) {
   }
 }
 
-#[op2(async)]
+#[op2]
 pub fn op_readable_stream_resource_write_buf(
   sender: *const c_void,
   #[buffer] buffer: JsBuffer,
@@ -589,7 +588,7 @@ pub fn op_readable_stream_resource_close(sender: *const c_void) {
   drop_sender(sender);
 }
 
-#[op2(async)]
+#[op2]
 pub fn op_readable_stream_resource_await_close(
   state: &mut OpState,
   #[smi] rid: ResourceId,

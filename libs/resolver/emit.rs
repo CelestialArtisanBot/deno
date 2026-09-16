@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -13,10 +13,16 @@ use deno_ast::SourceRanged;
 use deno_ast::SourceRangedForSpanned;
 use deno_ast::TranspileModuleOptions;
 use deno_ast::TranspileResult;
+use deno_ast::swc::ast::Decorator;
+use deno_ast::swc::ecma_visit::Visit;
+use deno_ast::swc::ecma_visit::VisitWith;
+use deno_ast::swc::ecma_visit::noop_visit_type;
 use deno_error::JsErrorBox;
 use deno_graph::MediaType;
 use deno_graph::Module;
 use deno_graph::ModuleGraph;
+use deno_maybe_sync::MaybeSend;
+use deno_maybe_sync::MaybeSync;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -30,15 +36,16 @@ use crate::cjs::CjsTrackerRc;
 use crate::deno_json::CompilerOptionsParseError;
 use crate::deno_json::CompilerOptionsResolverRc;
 use crate::deno_json::TranspileAndEmitOptions;
-use crate::sync::MaybeSend;
-use crate::sync::MaybeSync;
 
-#[allow(clippy::disallowed_types)] // ok because we always store source text as Arc<str>
+#[allow(
+  clippy::disallowed_types,
+  reason = "source text is always stored as Arc<str>"
+)]
 type ArcStr = std::sync::Arc<str>;
 
-#[allow(clippy::disallowed_types)]
+#[allow(clippy::disallowed_types, reason = "definition")]
 pub type EmitterRc<TInNpmPackageChecker, TSys> =
-  crate::sync::MaybeArc<Emitter<TInNpmPackageChecker, TSys>>;
+  deno_maybe_sync::MaybeArc<Emitter<TInNpmPackageChecker, TSys>>;
 
 #[sys_traits::auto_impl]
 pub trait EmitterSys: EmitCacheSys {}
@@ -173,8 +180,7 @@ impl<TInNpmPackageChecker: InNpmPackageChecker, TSys: EmitterSys>
     }
     let transpile_options = &transpile_and_emit_options.transpile;
     if matches!(provider.media_type(), MediaType::Jsx)
-      && !transpile_options.transform_jsx
-      && !transpile_options.precompile_jsx
+      && transpile_options.jsx.is_none()
     {
       // jsx disabled, so skip
       return Ok(provider.into_source());
@@ -217,7 +223,10 @@ impl<TInNpmPackageChecker: InNpmPackageChecker, TSys: EmitterSys>
     }
   }
 
-  #[allow(clippy::result_large_err)]
+  #[allow(
+    clippy::result_large_err,
+    reason = "EmitParsedSourceHelperError is intentionally large"
+  )]
   pub fn maybe_emit_source_sync(
     &self,
     specifier: &Url,
@@ -237,10 +246,7 @@ impl<TInNpmPackageChecker: InNpmPackageChecker, TSys: EmitterSys>
       return Ok(source.clone());
     }
     let transpile_options = &transpile_and_emit_options.transpile;
-    if matches!(media_type, MediaType::Jsx)
-      && !transpile_options.transform_jsx
-      && !transpile_options.precompile_jsx
-    {
+    if matches!(media_type, MediaType::Jsx) && transpile_options.jsx.is_none() {
       // jsx disabled, so skip
       return Ok(source.clone());
     }
@@ -350,6 +356,7 @@ impl<TInNpmPackageChecker: InNpmPackageChecker, TSys: EmitterSys>
             },
             &options,
           )
+          .map_err(dedupe_transpile_error)
           .map_err(JsErrorBox::from_err)?
           .into_source();
         Ok(transpiled_source.text)
@@ -361,6 +368,9 @@ impl<TInNpmPackageChecker: InNpmPackageChecker, TSys: EmitterSys>
       | MediaType::Dmts
       | MediaType::Dcts
       | MediaType::Json
+      | MediaType::Jsonc
+      | MediaType::Json5
+      | MediaType::Markdown
       | MediaType::Wasm
       | MediaType::Css
       | MediaType::Html
@@ -391,6 +401,10 @@ impl<TInNpmPackageChecker: InNpmPackageChecker, TSys: EmitterSys>
   }
 }
 
+#[allow(
+  clippy::result_large_err,
+  reason = "EmitParsedSourceHelperError is intentionally large"
+)]
 trait ParsedSourceProvider: MaybeSend + MaybeSync + Clone + 'static {
   fn specifier(&self) -> &Url;
   fn media_type(&self) -> MediaType;
@@ -513,7 +527,10 @@ impl<TInNpmPackageChecker: InNpmPackageChecker, TSys: EmitterSys>
   }
 }
 
-#[allow(clippy::result_large_err)]
+#[allow(
+  clippy::result_large_err,
+  reason = "EmitParsedSourceHelperError is intentionally large"
+)]
 fn transpile(
   parsed_source: ParsedSource,
   module_kind: deno_ast::ModuleKind,
@@ -521,21 +538,167 @@ fn transpile(
   emit_options: &deno_ast::EmitOptions,
 ) -> Result<EmittedSourceText, EmitParsedSourceHelperError> {
   ensure_no_import_assertion(&parsed_source)?;
-  let transpile_result = parsed_source.transpile(
-    transpile_options,
-    &TranspileModuleOptions {
-      module_kind: Some(module_kind),
-    },
-    emit_options,
-  )?;
-  let transpiled_source = match transpile_result {
+  if let Some(diagnostics) = invalid_syntax_parse_diagnostics(&parsed_source) {
+    return Err(deno_ast::TranspileError::ParseErrors(diagnostics).into());
+  }
+  // Skip the decorator transform when the module has no decorators. The
+  // swc decorator pass otherwise hoists every computed class-member key into
+  // a `var _computedKey; _computedKey = ...;` pair at module scope, which
+  // looks like a side effect and blocks downstream tree-shaking (e.g. in
+  // `deno bundle`). See denoland/deno#30817.
+  let owned_options;
+  let transpile_options = if !matches!(
+    transpile_options.decorators,
+    deno_ast::DecoratorsTranspileOption::None
+  ) && !program_has_decorators(
+    parsed_source.program_ref(),
+  ) {
+    owned_options = deno_ast::TranspileOptions {
+      decorators: deno_ast::DecoratorsTranspileOption::None,
+      ..transpile_options.clone()
+    };
+    &owned_options
+  } else {
+    transpile_options
+  };
+  let transpile_result = parsed_source
+    .transpile(
+      transpile_options,
+      &TranspileModuleOptions {
+        module_kind: Some(module_kind),
+      },
+      emit_options,
+    )
+    .map_err(dedupe_transpile_error)?;
+  let mut transpiled_source = match transpile_result {
     TranspileResult::Owned(source) => source,
     TranspileResult::Cloned(source) => {
       debug_assert!(false, "Transpile owned failed.");
       source
     }
   };
+  patch_public_decorator_access_has(&mut transpiled_source.text);
   Ok(transpiled_source)
+}
+
+pub fn patch_public_decorator_access_has(source: &mut String) {
+  if !source.contains("_apply_decs_2203_r") {
+    return;
+  }
+
+  const OLD_EMITTED_ACCESS_OBJECT: &str = concat!(
+    "    ctx.access = get && set ? {\n",
+    "      get: get,\n",
+    "      set: set\n",
+    "    } : get ? {\n",
+    "      get: get\n",
+    "    } : {\n",
+    "      set: set\n",
+    "    };\n",
+  );
+  const NEW_EMITTED_ACCESS_OBJECT: &str = concat!(
+    "    if (isPrivate) {\n",
+    "      ctx.access = get && set ? { get: get, set: set } : get ? { get: get } : { set: set };\n",
+    "    } else {\n",
+    "      if (get) { var originalGet = get; get = function(target) { if (arguments.length === 0) target = this; return originalGet.call(target); }; }\n",
+    "      if (set) { var originalSet = set; set = function(target, value) { if (arguments.length === 1) { value = target; target = this; } return originalSet.call(target, value); }; }\n",
+    "      var has = function(target) { return name in target; };\n",
+    "      ctx.access = get && set ? { has: has, get: get, set: set } : get ? { has: has, get: get } : { has: has, set: set };\n",
+    "    }\n",
+  );
+  *source =
+    source.replace(OLD_EMITTED_ACCESS_OBJECT, NEW_EMITTED_ACCESS_OBJECT);
+}
+
+fn program_has_decorators(program: deno_ast::ProgramRef<'_>) -> bool {
+  #[derive(Default)]
+  struct DecoratorDetector {
+    found: bool,
+  }
+
+  impl Visit for DecoratorDetector {
+    noop_visit_type!();
+
+    fn visit_decorator(&mut self, _: &Decorator) {
+      self.found = true;
+    }
+  }
+
+  let mut detector = DecoratorDetector::default();
+  program.visit_with(&mut detector);
+  detector.found
+}
+
+/// When `swc` recovers from a syntax error it leaves an `Invalid` placeholder
+/// node in the AST. The code generator emits these as the literal text
+/// `<invalid>`, which then surfaces downstream as a misleading
+/// `Uncaught SyntaxError: Unexpected token '<'` once the emitted output is
+/// executed. If any such node is present, return the (otherwise non-fatal)
+/// parse diagnostics so a precise syntax error can be reported instead of
+/// emitting broken JavaScript. See denoland/deno#19457.
+pub fn invalid_syntax_parse_diagnostics(
+  parsed_source: &ParsedSource,
+) -> Option<deno_ast::ParseDiagnosticsError> {
+  let diagnostics = parsed_source.diagnostics();
+  // Fast path: well-formed sources have no recovered-from diagnostics, and
+  // `swc` only ever inserts an `Invalid` node alongside one, so there's no
+  // need to walk the AST.
+  if diagnostics.is_empty() {
+    return None;
+  }
+
+  #[derive(Default)]
+  struct InvalidNodeDetector {
+    found: bool,
+  }
+
+  impl Visit for InvalidNodeDetector {
+    noop_visit_type!();
+
+    fn visit_invalid(&mut self, _: &deno_ast::swc::ast::Invalid) {
+      self.found = true;
+    }
+  }
+
+  let mut detector = InvalidNodeDetector::default();
+  parsed_source.program_ref().visit_with(&mut detector);
+  if !detector.found {
+    return None;
+  }
+
+  Some(deno_ast::ParseDiagnosticsError(diagnostics.clone()))
+}
+
+/// `swc` sometimes reports the exact same fatal parse diagnostic more than
+/// once (ex. `for (console.log("a") of [1]);`), which would otherwise be shown
+/// to the user as a duplicated error message. Collapse identical diagnostics
+/// while keeping the original order. See denoland/deno#27804.
+pub fn dedupe_transpile_error(
+  err: deno_ast::TranspileError,
+) -> deno_ast::TranspileError {
+  fn dedupe(
+    diagnostics: deno_ast::ParseDiagnosticsError,
+  ) -> deno_ast::ParseDiagnosticsError {
+    let mut deduped = Vec::with_capacity(diagnostics.0.len());
+    for diagnostic in diagnostics.0 {
+      if !deduped.contains(&diagnostic) {
+        deduped.push(diagnostic);
+      }
+    }
+    deno_ast::ParseDiagnosticsError(deduped)
+  }
+
+  match err {
+    deno_ast::TranspileError::ParseErrors(diagnostics) => {
+      deno_ast::TranspileError::ParseErrors(dedupe(diagnostics))
+    }
+    deno_ast::TranspileError::FoldProgram(
+      deno_ast::FoldProgramError::ParseDiagnostics(diagnostics),
+    ) => deno_ast::TranspileError::FoldProgram(
+      deno_ast::FoldProgramError::ParseDiagnostics(dedupe(diagnostics)),
+    ),
+    err => err,
+  }
 }
 
 // todo(dsherret): this is a temporary measure until we have swc erroring for this

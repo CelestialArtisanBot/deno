@@ -1,8 +1,9 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::borrow::Cow;
 
 use deno_cache_dir::npm::mixed_case_package_name_decode;
+use deno_cache_dir::npm::mixed_case_package_name_encode;
 use deno_npm::NpmPackageCacheFolderId;
 use deno_semver::StackString;
 use deno_semver::package::PackageNv;
@@ -55,7 +56,9 @@ pub fn get_package_folder_id_from_folder_name(
 }
 
 /// Normalizes a package name for use at `node_modules/.deno/<pkg-name>@<version>[_<copy_index>]`
-pub fn normalize_pkg_name_for_node_modules_deno_folder(name: &str) -> Cow<str> {
+pub fn normalize_pkg_name_for_node_modules_deno_folder(
+  name: &str,
+) -> Cow<'_, str> {
   let name = if name.to_lowercase() == name {
     Cow::Borrowed(name)
   } else {
@@ -66,16 +69,6 @@ pub fn normalize_pkg_name_for_node_modules_deno_folder(name: &str) -> Cow<str> {
   } else {
     name
   }
-}
-
-fn mixed_case_package_name_encode(name: &str) -> String {
-  // use base32 encoding because it's reversible and the character set
-  // only includes the characters within 0-9 and A-Z so it can be lower cased
-  base32::encode(
-    base32::Alphabet::Rfc4648Lower { padding: false },
-    name.as_bytes(),
-  )
-  .to_lowercase()
 }
 
 #[cfg(test)]

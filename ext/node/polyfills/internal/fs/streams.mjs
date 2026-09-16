@@ -1,49 +1,61 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 // Copyright Joyent, Inc. and Node.js contributors. All rights reserved. MIT license.
 
-import { primordials } from "ext:core/mod.js";
+import { core, primordials } from "ext:core/mod.js";
 const {
   Array,
+  FunctionPrototypeBind,
   MathMin,
   NumberPOSITIVE_INFINITY,
   ObjectDefineProperty,
   ObjectPrototypeIsPrototypeOf,
   ObjectSetPrototypeOf,
+  PromisePrototypeThen,
   Promise,
   ReflectApply,
   StringPrototypeToString,
   Symbol,
 } = primordials;
-import {
+const {
   ERR_INVALID_ARG_TYPE,
+  ERR_METHOD_NOT_IMPLEMENTED,
   ERR_OUT_OF_RANGE,
-} from "ext:deno_node/internal/errors.ts";
-import { kEmptyObject } from "ext:deno_node/internal/util.mjs";
-import { deprecate } from "node:util";
-import {
+} = core.loadExtScript("ext:deno_node/internal/errors.ts");
+const { kEmptyObject } = core.loadExtScript("ext:deno_node/internal/util.mjs");
+const { deprecate } = core.loadExtScript("ext:deno_node/util.ts");
+const {
+  validateBoolean,
   validateFunction,
   validateInteger,
-} from "ext:deno_node/internal/validators.mjs";
-import { errorOrDestroy } from "ext:deno_node/internal/streams/destroy.js";
-import { open as fsOpen } from "ext:deno_node/_fs/_fs_open.ts";
-import { read as fsRead } from "ext:deno_node/_fs/_fs_read.ts";
-import { write as fsWrite } from "ext:deno_node/_fs/_fs_write.mjs";
-import { writev as fsWritev } from "ext:deno_node/_fs/_fs_writev.ts";
-import { close as fsClose } from "ext:deno_node/_fs/_fs_close.ts";
-import { Buffer } from "node:buffer";
+} = core.loadExtScript("ext:deno_node/internal/validators.mjs");
+const { errorOrDestroy } = core.loadExtScript(
+  "ext:deno_node/internal/streams/destroy.js",
+);
+// Resolve the CJS `node:fs` exports object (fs.ts) rather than the ESM
+// namespace (fs_esm.ts, whose `export const fsync = mod.fsync` bindings are a
+// static snapshot). This mirrors Node's `const fs = require('fs')` and ensures
+// monkey-patches/mocks on the `node:fs` namespace (e.g. the `flush` option's
+// fsync) are observed. `loadExtScript` caches, so repeat calls are cheap; all
+// call sites invoke `lazyFs()` at runtime, never at module-eval time.
+const lazyFs = () => core.loadExtScript("ext:deno_node/fs.ts");
+const { Buffer } = core.loadExtScript("ext:deno_node/internal/buffer.mjs");
 import {
   copyObject,
   getOptions,
   getValidatedFd,
   validatePath,
 } from "ext:deno_node/internal/fs/utils.mjs";
-import { finished, Readable, Writable } from "node:stream";
-import { toPathIfFileURL } from "ext:deno_node/internal/url.ts";
-import { nextTick } from "ext:deno_node/_next_tick.ts";
+const lazyStream = core.createLazyLoader("node:stream");
+const { toPathIfFileURL } = core.loadExtScript(
+  "ext:deno_node/internal/url.ts",
+);
+const { nextTick } = core.loadExtScript("ext:deno_node/_next_tick.ts");
+import { FileHandle, kRef, kUnref } from "ext:deno_node/internal/fs/handle.ts";
+
 const kIoDone = Symbol("kIoDone");
 const kIsPerformingIO = Symbol("kIsPerformingIO");
-
 const kFs = Symbol("kFs");
+const kHandle = Symbol("kHandle");
 
 function _construct(callback) {
   // deno-lint-ignore no-this-alias
@@ -71,7 +83,7 @@ function _construct(callback) {
     stream.open();
   } else {
     const streamPath = Buffer.isBuffer(stream.path)
-      // deno-lint-ignore prefer-primordials uses `toString` method from `node:buffer`
+      // deno-lint-ignore deno-internal/prefer-primordials -- uses `toString` method from `node:buffer`
       ? stream.path.toString()
       : StringPrototypeToString(stream.path);
     stream[kFs].open(
@@ -91,16 +103,65 @@ function _construct(callback) {
     );
   }
 }
+/**
+ * @param {import("node:fs/promises").FileHandle} handle
+ */
+const FileHandleOperations = (handle) => {
+  return {
+    open: (_path, _flags, _mode, _cb) => {
+      throw new ERR_METHOD_NOT_IMPLEMENTED("open()");
+    },
+    close: (_fd, cb) => {
+      handle[kUnref]();
+      PromisePrototypeThen(handle.close(), () => cb(), cb);
+    },
+    fsync: (_fd, cb) => {
+      PromisePrototypeThen(handle.sync(), () => cb(), cb);
+    },
+    read: (_fd, buf, offset, length, pos, cb) => {
+      PromisePrototypeThen(
+        handle.read(buf, offset, length, pos),
+        // deno-lint-ignore deno-internal/prefer-primordials
+        (r) => cb(null, r.bytesRead, r.buffer),
+        (err) => cb(err, 0, buf),
+      );
+    },
+    write: (_fd, buf, offset, length, pos, cb) => {
+      PromisePrototypeThen(
+        handle.write(buf, offset, length, pos),
+        // deno-lint-ignore deno-internal/prefer-primordials
+        (r) => cb(null, r.bytesWritten, r.buffer),
+        (err) => cb(err, 0, buf),
+      );
+    },
+    writev: (_fd, buffers, pos, cb) => {
+      PromisePrototypeThen(
+        handle.writev(buffers, pos),
+        (r) => cb(null, r.bytesWritten, r.buffers),
+        (err) => cb(err, 0, buffers),
+      );
+    },
+  };
+};
 
 function close(stream, err, cb) {
   if (!stream.fd) {
     cb(err);
-  } else {
-    stream[kFs].close(stream.fd, (er) => {
-      cb(er || err);
+  } else if (stream.flush) {
+    // The `flush` option fsyncs the descriptor before closing it.
+    stream[kFs].fsync(stream.fd, (flushErr) => {
+      _closeFd(stream, err || flushErr, cb);
     });
-    stream.fd = null;
+  } else {
+    _closeFd(stream, err, cb);
   }
+}
+
+function _closeFd(stream, err, cb) {
+  stream[kFs].close(stream.fd, (er) => {
+    cb(er || err);
+  });
+  stream.fd = null;
 }
 
 function importFd(stream, options) {
@@ -109,17 +170,29 @@ function importFd(stream, options) {
     // that the descriptor won't get closed, or worse, replaced with
     // another one
     // https://github.com/nodejs/node/issues/35862
-    if (ObjectPrototypeIsPrototypeOf(ReadStream.prototype, stream)) {
-      stream[kFs] = options.fs || { read: fsRead, close: fsClose };
-    }
-    if (ObjectPrototypeIsPrototypeOf(WriteStream.prototype, stream)) {
-      stream[kFs] = options.fs ||
-        { write: fsWrite, writev: fsWritev, close: fsClose };
-    }
+    stream[kFs] = options.fs || lazyFs();
     return options.fd;
+  } else if (
+    typeof options.fd === "object" &&
+    ObjectPrototypeIsPrototypeOf(FileHandle.prototype, options.fd)
+  ) {
+    // When fd is a FileHandle we can listen for 'close' events
+    if (options.fs) {
+      // FileHandle is not supported with custom fs operations
+      throw new ERR_METHOD_NOT_IMPLEMENTED("FileHandle with fs");
+    }
+    stream[kHandle] = options.fd;
+    stream[kFs] = FileHandleOperations(stream[kHandle]);
+    stream[kHandle][kRef]();
+    options.fd.on("close", FunctionPrototypeBind(stream.close, stream));
+    return options.fd.fd;
   }
 
-  throw new ERR_INVALID_ARG_TYPE("options.fd", ["number"], options.fd);
+  throw new ERR_INVALID_ARG_TYPE(
+    "options.fd",
+    ["number", "FileHandle"],
+    options.fd,
+  );
 }
 
 export function ReadStream(path, options) {
@@ -139,7 +212,7 @@ export function ReadStream(path, options) {
 
   if (options.fd == null) {
     this.fd = null;
-    this[kFs] = options.fs || { open: fsOpen, read: fsRead, close: fsClose };
+    this[kFs] = options.fs || lazyFs();
     validateFunction(this[kFs].open, "options.fs.open");
 
     // Path will be ignored when fd is specified, so it can be falsy
@@ -186,11 +259,11 @@ export function ReadStream(path, options) {
     }
   }
 
-  ReflectApply(Readable, this, [options]);
+  ReflectApply(lazyStream().Readable, this, [options]);
 }
 
-ObjectSetPrototypeOf(ReadStream.prototype, Readable.prototype);
-ObjectSetPrototypeOf(ReadStream, Readable);
+ObjectSetPrototypeOf(ReadStream.prototype, lazyStream().Readable.prototype);
+ObjectSetPrototypeOf(ReadStream, lazyStream().Readable);
 
 ObjectDefineProperty(ReadStream.prototype, "autoClose", {
   __proto__: null,
@@ -220,7 +293,7 @@ ReadStream.prototype._read = async function (n) {
 
   if (n <= 0) {
     // Ignore lint. The `push` method is inherited from the `stream.Readable` class.
-    // deno-lint-ignore prefer-primordials
+    // deno-lint-ignore deno-internal/prefer-primordials
     this.push(null);
     return;
   }
@@ -280,11 +353,11 @@ ReadStream.prototype._read = async function (n) {
     }
 
     // Ignore lint. The `push` method is inherited from the `stream.Readable` class.
-    // deno-lint-ignore prefer-primordials
+    // deno-lint-ignore deno-internal/prefer-primordials
     this.push(buffer);
   } else {
     // Ignore lint. The `push` method is inherited from the `stream.Readable` class.
-    // deno-lint-ignore prefer-primordials
+    // deno-lint-ignore deno-internal/prefer-primordials
     this.push(null);
   }
 };
@@ -304,7 +377,7 @@ ReadStream.prototype._destroy = function (err, cb) {
 };
 
 ReadStream.prototype.close = function (cb) {
-  if (typeof cb === "function") finished(this, cb);
+  if (typeof cb === "function") lazyStream().finished(this, cb);
   this.destroy();
 };
 
@@ -328,8 +401,7 @@ export function WriteStream(path, options) {
 
   if (options.fd == null) {
     this.fd = null;
-    this[kFs] = options.fs ||
-      { open: fsOpen, write: fsWrite, writev: fsWritev, close: fsClose };
+    this[kFs] = options.fs || lazyFs();
     validateFunction(this[kFs].open, "options.fs.open");
 
     // Path will be ignored when fd is specified, so it can be falsy
@@ -374,6 +446,14 @@ export function WriteStream(path, options) {
     this._writev = null;
   }
 
+  this.flush = options.flush;
+  if (this.flush == null) {
+    this.flush = false;
+  } else {
+    validateBoolean(this.flush, "options.flush");
+    validateFunction(this[kFs].fsync, "options.fs.fsync");
+  }
+
   this.start = options.start;
   this.pos = undefined;
   this.bytesWritten = 0;
@@ -385,15 +465,15 @@ export function WriteStream(path, options) {
     this.pos = this.start;
   }
 
-  ReflectApply(Writable, this, [options]);
+  ReflectApply(lazyStream().Writable, this, [options]);
 
   if (options.encoding) {
     this.setDefaultEncoding(options.encoding);
   }
 }
 
-ObjectSetPrototypeOf(WriteStream.prototype, Writable.prototype);
-ObjectSetPrototypeOf(WriteStream, Writable);
+ObjectSetPrototypeOf(WriteStream.prototype, lazyStream().Writable.prototype);
+ObjectSetPrototypeOf(WriteStream, lazyStream().Writable);
 
 ObjectDefineProperty(WriteStream.prototype, "autoClose", {
   __proto__: null,
